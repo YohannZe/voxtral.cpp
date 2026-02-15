@@ -1,6 +1,20 @@
-# voxtral.cpp
+# Voxtral.cpp
 
 A ggml-based C++ implementation of Voxtral Realtime 4B.
+
+## Voxtral References
+
+- Official Mistral Voxtral announcement: https://mistral.ai/news/voxtral
+- Mistral Audio & Transcription docs: https://docs.mistral.ai/capabilities/audio_transcription
+- Mistral Audio Transcriptions API: https://docs.mistral.ai/api/endpoint/audio/transcriptions
+
+## Model Weights (GGUF)
+
+Quantized GGUF weights used by this project are hosted on Hugging Face:
+
+- https://huggingface.co/andrijdavid/Voxtral-Mini-4B-Realtime-2602-GGUF
+
+The `download_model.sh` script downloads from that repository.
 
 ## Quickstart
 
@@ -54,6 +68,34 @@ You can quantize an existing GGUF file using the native quantizer:
   Q6_K \
   8
 ```
+
+### `voxtral-quantize`
+
+Command format:
+
+```bash
+./build/voxtral-quantize <input.gguf> <output.gguf> <type> [nthreads]
+```
+
+Examples:
+
+```bash
+# 1) Quantize to Q4_0 using default thread count
+./build/voxtral-quantize models/voxtral/voxtral.gguf models/voxtral/Q4_0.gguf Q4_0
+
+# 2) Quantize to Q6_K using 8 threads
+./build/voxtral-quantize models/voxtral/voxtral.gguf models/voxtral/Q6_K.gguf Q6_K 8
+```
+
+Supported `type` values:
+
+`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q4_K_M`
+
+Notes:
+
+- Input must be a Voxtral GGUF (`general.architecture = voxtral_realtime`).
+- `Q4_K_M` uses a mixed strategy internally (some tensors kept at higher precision).
+- `nthreads` is optional; when omitted, hardware concurrency is used.
 
 ## Testing
 
