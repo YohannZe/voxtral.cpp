@@ -101,6 +101,12 @@ add_subdirectory(ggml)
 add_library(voxtral_lib
     src/voxtral.cpp)
 
+# On Windows with BUILD_SHARED_LIBS=ON, export symbols automatically so the
+# import library (voxtral_lib.lib) is generated for dependents like `voxtral`.
+if(WIN32 AND BUILD_SHARED_LIBS)
+    set_target_properties(voxtral_lib PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
+
 target_include_directories(voxtral_lib
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
