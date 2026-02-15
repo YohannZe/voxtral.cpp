@@ -108,9 +108,15 @@ target_include_directories(voxtral_lib
 target_link_libraries(voxtral_lib
     PUBLIC
         ggml
-        Threads::Threads
-        m
-        dl)
+        Threads::Threads)
+
+if(NOT WIN32)
+    target_link_libraries(voxtral_lib PUBLIC m)
+endif()
+
+if(CMAKE_DL_LIBS)
+    target_link_libraries(voxtral_lib PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 if(VOXTRAL_WARNINGS_AS_ERRORS)
     if (MSVC)
@@ -121,14 +127,26 @@ if(VOXTRAL_WARNINGS_AS_ERRORS)
 endif()
 
 if(VOXTRAL_NATIVE_OPT AND NOT MSVC)
-    target_compile_options(voxtral_lib PRIVATE -march=native -mtune=native)
+    if(APPLE)
+        message(STATUS "VOXTRAL_NATIVE_OPT: skipping -march/-mtune=native on Apple toolchains")
+    else()
+        target_compile_options(voxtral_lib PRIVATE -march=native -mtune=native)
+    endif()
 endif()
 
 add_executable(voxtral src/main.cpp)
 target_link_libraries(voxtral PRIVATE voxtral_lib)
 
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
-target_link_libraries(voxtral-quantize PRIVATE ggml Threads::Threads m dl)
+target_link_libraries(voxtral-quantize PRIVATE ggml Threads::Threads)
+
+if(NOT WIN32)
+    target_link_libraries(voxtral-quantize PRIVATE m)
+endif()
+
+if(CMAKE_DL_LIBS)
+    target_link_libraries(voxtral-quantize PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(VOXTRAL_WARNINGS_AS_ERRORS)
     if (MSVC)
@@ -139,7 +157,9 @@ if(VOXTRAL_WARNINGS_AS_ERRORS)
 endif()
 
 if(VOXTRAL_NATIVE_OPT AND NOT MSVC)
-    target_compile_options(voxtral-quantize PRIVATE -march=native -mtune=native)
+    if(NOT APPLE)
+        target_compile_options(voxtral-quantize PRIVATE -march=native -mtune=native)
+    endif()
 endif()
 
 find_package(Python3 COMPONENTS Interpreter)
