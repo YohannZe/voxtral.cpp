@@ -1,5 +1,9 @@
 #include "voxtral.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -22,8 +26,172 @@ struct cli_params {
     uint32_t seed = 0;
     int32_t max_tokens = 256;
     voxtral_log_level log_level = voxtral_log_level::info;
-    bool use_metal = false;
+    voxtral_gpu_backend gpu = voxtral_gpu_backend::none;
 };
+
+struct backend_reg_info {
+    std::string name;
+    size_t devices = 0;
+};
+
+std::string to_lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+bool has_runtime_backend(const std::vector<backend_reg_info> & regs, const std::string & name) {
+    const std::string name_lc = to_lower_copy(name);
+    for (const auto & reg : regs) {
+        if (to_lower_copy(reg.name) == name_lc) {
+            return reg.devices > 0;
+        }
+    }
+    return false;
+}
+
+std::vector<backend_reg_info> collect_runtime_backends() {
+    std::vector<backend_reg_info> regs;
+    const size_t n_reg = ggml_backend_reg_count();
+    regs.reserve(n_reg);
+
+    for (size_t i = 0; i < n_reg; ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (!reg) {
+            continue;
+        }
+
+        const char * name = ggml_backend_reg_name(reg);
+        regs.push_back({
+            name ? name : "unknown",
+            ggml_backend_reg_dev_count(reg),
+        });
+    }
+
+    return regs;
+}
+
+std::string format_build_backend_flags() {
+    std::ostringstream os;
+    bool first = true;
+    auto append_flag = [&](const char * name, bool enabled) {
+        if (!first) {
+            os << ", ";
+        }
+        os << name << '=' << (enabled ? "ON" : "OFF");
+        first = false;
+    };
+
+#ifdef GGML_USE_CPU
+    append_flag("GGML_USE_CPU", true);
+#else
+    append_flag("GGML_USE_CPU", false);
+#endif
+#ifdef GGML_USE_BLAS
+    append_flag("GGML_USE_BLAS", true);
+#else
+    append_flag("GGML_USE_BLAS", false);
+#endif
+#ifdef GGML_USE_METAL
+    append_flag("GGML_USE_METAL", true);
+#else
+    append_flag("GGML_USE_METAL", false);
+#endif
+#ifdef GGML_USE_CUDA
+    append_flag("GGML_USE_CUDA", true);
+#else
+    append_flag("GGML_USE_CUDA", false);
+#endif
+#ifdef GGML_USE_VULKAN
+    append_flag("GGML_USE_VULKAN", true);
+#else
+    append_flag("GGML_USE_VULKAN", false);
+#endif
+#ifdef GGML_USE_SYCL
+    append_flag("GGML_USE_SYCL", true);
+#else
+    append_flag("GGML_USE_SYCL", false);
+#endif
+#ifdef GGML_USE_OPENCL
+    append_flag("GGML_USE_OPENCL", true);
+#else
+    append_flag("GGML_USE_OPENCL", false);
+#endif
+#ifdef GGML_USE_CANN
+    append_flag("GGML_USE_CANN", true);
+#else
+    append_flag("GGML_USE_CANN", false);
+#endif
+#ifdef GGML_USE_WEBGPU
+    append_flag("GGML_USE_WEBGPU", true);
+#else
+    append_flag("GGML_USE_WEBGPU", false);
+#endif
+#ifdef GGML_USE_RPC
+    append_flag("GGML_USE_RPC", true);
+#else
+    append_flag("GGML_USE_RPC", false);
+#endif
+#ifdef GGML_USE_ZDNN
+    append_flag("GGML_USE_ZDNN", true);
+#else
+    append_flag("GGML_USE_ZDNN", false);
+#endif
+#ifdef GGML_USE_ZENDNN
+    append_flag("GGML_USE_ZENDNN", true);
+#else
+    append_flag("GGML_USE_ZENDNN", false);
+#endif
+#ifdef GGML_USE_HEXAGON
+    append_flag("GGML_USE_HEXAGON", true);
+#else
+    append_flag("GGML_USE_HEXAGON", false);
+#endif
+#ifdef GGML_USE_VIRTGPU_FRONTEND
+    append_flag("GGML_USE_VIRTGPU_FRONTEND", true);
+#else
+    append_flag("GGML_USE_VIRTGPU_FRONTEND", false);
+#endif
+
+    return os.str();
+}
+
+std::string format_runtime_backends(const std::vector<backend_reg_info> & regs) {
+    if (regs.empty()) {
+        return "none";
+    }
+
+    std::ostringstream os;
+    for (size_t i = 0; i < regs.size(); ++i) {
+        if (i > 0) {
+            os << ", ";
+        }
+        os << regs[i].name << '(' << regs[i].devices << " dev";
+        if (regs[i].devices != 1) {
+            os << 's';
+        }
+        os << ')';
+    }
+    return os.str();
+}
+
+std::string format_runtime_availability(const std::vector<backend_reg_info> & regs) {
+    static const std::array<const char *, 14> known_backends = {
+        "CPU", "BLAS", "METAL", "CUDA", "VULKAN", "SYCL", "OPENCL",
+        "CANN", "WEBGPU", "RPC", "ZDNN", "ZENDNN", "HEXAGON", "VIRTGPU",
+    };
+
+    std::ostringstream os;
+    for (size_t i = 0; i < known_backends.size(); ++i) {
+        if (i > 0) {
+            os << ", ";
+        }
+        os << known_backends[i] << '='
+           << (has_runtime_backend(regs, known_backends[i]) ? "yes" : "no");
+    }
+    return os.str();
+}
 
 void print_usage(const char * argv0) {
     std::cout
@@ -43,7 +211,8 @@ void print_usage(const char * argv0) {
         << "  --dump-logits-bin P   write full step-0 logits as float32 raw bytes\n"
         << "  --dump-tokens PATH    write generated token ids as a single line\n"
         << "  --output-text PATH    write decoded text to file (still prints to stdout)\n"
-        << "  --metal               use Metal backend when available\n"
+        << "  --gpu BACKEND         gpu backend: auto|cuda|metal|vulkan|none (default: none)\n"
+        << "  --metal               alias for --gpu metal\n"
         << "  -h, --help            show this help\n";
 }
 
@@ -65,6 +234,16 @@ bool parse_u32(const std::string & s, uint32_t & out) {
     }
     out = static_cast<uint32_t>(v);
     return true;
+}
+
+bool parse_gpu(const std::string & s, voxtral_gpu_backend & out) {
+    const std::string lc = to_lower_copy(s);
+    if (lc == "none")   { out = voxtral_gpu_backend::none;        return true; }
+    if (lc == "auto")   { out = voxtral_gpu_backend::auto_detect; return true; }
+    if (lc == "cuda")   { out = voxtral_gpu_backend::cuda;        return true; }
+    if (lc == "metal")  { out = voxtral_gpu_backend::metal;       return true; }
+    if (lc == "vulkan") { out = voxtral_gpu_backend::vulkan;      return true; }
+    return false;
 }
 
 bool parse_level(const std::string & s, voxtral_log_level & out) {
@@ -170,8 +349,14 @@ bool parse_args(int argc, char ** argv, cli_params & p) {
                 return false;
             }
             p.output_text = v;
+        } else if (a == "--gpu") {
+            const char * v = need_value("--gpu");
+            if (!v || !parse_gpu(v, p.gpu)) {
+                std::cerr << "invalid --gpu (expected: auto|cuda|metal|vulkan|none)\n";
+                return false;
+            }
         } else if (a == "--metal") {
-            p.use_metal = true;
+            p.gpu = voxtral_gpu_backend::metal;
         } else {
             std::cerr << "unknown option: " << a << "\n";
             return false;
@@ -204,6 +389,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const auto t_start = std::chrono::steady_clock::now();
+    auto finish = [&](int exit_code) {
+        const auto elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_start).count();
+        const std::vector<backend_reg_info> runtime_backends = collect_runtime_backends();
+
+        std::cerr << std::fixed << std::setprecision(2);
+        std::cerr << "[summary] processing_time_ms=" << elapsed_ms << "\n";
+        std::cerr << "[summary] build_backend_flags: " << format_build_backend_flags() << "\n";
+        std::cerr << "[summary] runtime_backends: " << format_runtime_backends(runtime_backends) << "\n";
+        std::cerr << "[summary] runtime_available: " << format_runtime_availability(runtime_backends) << "\n";
+        return exit_code;
+    };
+
     voxtral_log_callback logger = [level = p.log_level](voxtral_log_level msg_level, const std::string & msg) {
         if (static_cast<int>(msg_level) > static_cast<int>(level)) {
             return;
@@ -221,9 +420,9 @@ int main(int argc, char ** argv) {
         std::cerr << "voxtral_" << tag << ": " << msg << "\n";
     };
 
-    voxtral_model * model = voxtral_model_load_from_file(p.model, logger, p.use_metal);
+    voxtral_model * model = voxtral_model_load_from_file(p.model, logger, p.gpu);
     if (!model) {
-        return 2;
+        return finish(2);
     }
 
     voxtral_context_params ctx_p;
@@ -231,19 +430,19 @@ int main(int argc, char ** argv) {
     // ctx_p.seed = p.seed;
     ctx_p.log_level = p.log_level;
     ctx_p.logger = logger;
-    ctx_p.use_metal = p.use_metal;
+    ctx_p.gpu = p.gpu;
 
     voxtral_context * ctx = voxtral_init_from_model(model, ctx_p);
     if (!ctx) {
         voxtral_model_free(model);
-        return 3;
+        return finish(3);
     }
 
     voxtral_result result;
     if (!voxtral_transcribe_file(*ctx, p.audio, p.max_tokens, result)) {
         voxtral_free(ctx);
         voxtral_model_free(model);
-        return 4;
+        return finish(4);
     }
 
     const std::string printed_text = result.text.empty() ? std::string("[no-transcript]") : result.text;
@@ -312,5 +511,5 @@ int main(int argc, char ** argv) {
 
     voxtral_free(ctx);
     voxtral_model_free(model);
-    return 0;
+    return finish(0);
 }

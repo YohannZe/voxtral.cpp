@@ -80,6 +80,14 @@ enum class voxtral_log_level : int {
     debug = 3,
 };
 
+enum class voxtral_gpu_backend : int {
+    none = 0,
+    auto_detect,
+    cuda,
+    metal,
+    vulkan,
+};
+
 using voxtral_log_callback = std::function<void(voxtral_log_level, const std::string &)>;
 
 // ============================================================================
@@ -96,7 +104,7 @@ struct voxtral_context_params {
     int32_t              n_threads  = 0;
     voxtral_log_level    log_level  = voxtral_log_level::info;
     voxtral_log_callback logger     = nullptr;
-    bool                 use_metal  = false;
+    voxtral_gpu_backend  gpu        = voxtral_gpu_backend::none;
 };
 
 // ============================================================================
@@ -122,7 +130,7 @@ struct voxtral_context;
 voxtral_model * voxtral_model_load_from_file(
     const std::string    & path,
     voxtral_log_callback   logger = nullptr,
-    bool                   use_metal = false);
+    voxtral_gpu_backend    gpu = voxtral_gpu_backend::none);
 
 void voxtral_model_free(voxtral_model * model);
 

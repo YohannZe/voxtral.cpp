@@ -4,6 +4,15 @@
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+#ifdef GGML_USE_BLAS
+#include "ggml-blas.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -118,7 +127,8 @@ struct voxtral_model {
     gguf_context * gguf_ctx   = nullptr;
     ggml_backend_buffer_t buf_weights = nullptr;
     ggml_backend_t         backend_weights = nullptr;
-    bool                   weights_on_metal = false;
+    bool                   weights_on_gpu = false;
+    voxtral_gpu_backend    gpu_type = voxtral_gpu_backend::none;
 };
 
 // ============================================================================
@@ -134,7 +144,8 @@ struct voxtral_context {
     // Backend
     ggml_backend_t         backend      = nullptr;
     ggml_backend_t         backend_cpu  = nullptr;
-    bool                   backend_is_cpu = true;
+    ggml_backend_t         blas_backend = nullptr;
+    voxtral_gpu_backend    gpu_type     = voxtral_gpu_backend::none;
 
     // Persistent device tensors (allocated once)
     ggml_context  * ctx_persistent = nullptr;
@@ -596,7 +607,7 @@ static ggml_tensor * get_tensor(ggml_context * ctx, const char * name) {
 voxtral_model * voxtral_model_load_from_file(
     const std::string    & path,
     voxtral_log_callback   logger,
-    bool                   use_metal)
+    voxtral_gpu_backend    gpu)
 {
     auto log_info = [&](const std::string & msg) {
         if (logger) logger(voxtral_log_level::info, msg);
@@ -623,25 +634,68 @@ voxtral_model * voxtral_model_load_from_file(
 
     // Allocate a backend buffer for all the weights
     ggml_backend_t weights_backend = nullptr;
-#ifdef GGML_USE_METAL
-    if (use_metal) {
-        weights_backend = ggml_backend_metal_init();
-        if (!weights_backend) {
-            fprintf(stderr, "voxtral: ggml_backend_metal_init() failed, falling back to CPU\n");
-        }
-    }
-#else
-    if (use_metal) {
-        fprintf(stderr, "voxtral: Metal backend not available in this build, using CPU\n");
-    }
+    voxtral_gpu_backend resolved_gpu = voxtral_gpu_backend::none;
+
+    auto try_cuda = [&]() -> bool {
+#ifdef GGML_USE_CUDA
+        weights_backend = ggml_backend_cuda_init(0);
+        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::cuda; return true; }
+        log_info("CUDA backend init failed");
 #endif
+        return false;
+    };
+
+    auto try_metal = [&]() -> bool {
+#ifdef GGML_USE_METAL
+        weights_backend = ggml_backend_metal_init();
+        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::metal; return true; }
+        log_info("Metal backend init failed");
+#endif
+        return false;
+    };
+
+    auto try_vulkan = [&]() -> bool {
+#ifdef GGML_USE_VULKAN
+        weights_backend = ggml_backend_vk_init(0);
+        if (weights_backend) { resolved_gpu = voxtral_gpu_backend::vulkan; return true; }
+        log_info("Vulkan backend init failed");
+#endif
+        return false;
+    };
+
+    switch (gpu) {
+        case voxtral_gpu_backend::cuda:
+            if (!try_cuda()) {
+                log_info("CUDA not available in this build, falling back to CPU");
+            }
+            break;
+        case voxtral_gpu_backend::metal:
+            if (!try_metal()) {
+                log_info("Metal not available in this build, falling back to CPU");
+            }
+            break;
+        case voxtral_gpu_backend::vulkan:
+            if (!try_vulkan()) {
+                log_info("Vulkan not available in this build, falling back to CPU");
+            }
+            break;
+        case voxtral_gpu_backend::auto_detect:
+            if (!try_cuda() && !try_metal() && !try_vulkan()) {
+                log_info("no GPU backend available, using CPU");
+            }
+            break;
+        case voxtral_gpu_backend::none:
+        default:
+            break;
+    }
+
     if (!weights_backend) {
         weights_backend = ggml_backend_cpu_init();
-        use_metal = false;
     }
 
     model->backend_weights = weights_backend;
-    model->weights_on_metal = use_metal;
+    model->weights_on_gpu = (resolved_gpu != voxtral_gpu_backend::none);
+    model->gpu_type = resolved_gpu;
     model->buf_weights = ggml_backend_alloc_ctx_tensors(ctx_meta, weights_backend);
 
     if (!model->buf_weights) {
@@ -821,32 +875,76 @@ voxtral_context * voxtral_init_from_model(
     ctx->logger    = params.logger;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    // Select backend
-    bool want_metal = params.use_metal || (model && model->weights_on_metal);
-
-#ifdef GGML_USE_METAL
-    if (want_metal) {
-        ctx->backend = ggml_backend_metal_init();
-        if (!ctx->backend) {
-            LOG_WARN(ctx, "failed to initialize Metal backend, falling back to CPU");
-        }
+    // Select GPU backend — inherit from model if params say none
+    voxtral_gpu_backend gpu = params.gpu;
+    if (gpu == voxtral_gpu_backend::none && model && model->weights_on_gpu) {
+        gpu = model->gpu_type;
     }
+    ctx->gpu_type = voxtral_gpu_backend::none;
+
+    auto try_cuda_ctx = [&]() -> bool {
+#ifdef GGML_USE_CUDA
+        ctx->backend = ggml_backend_cuda_init(0);
+        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::cuda; return true; }
+        LOG_WARN(ctx, "CUDA backend init failed");
 #endif
+        return false;
+    };
+    auto try_metal_ctx = [&]() -> bool {
+#ifdef GGML_USE_METAL
+        ctx->backend = ggml_backend_metal_init();
+        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::metal; return true; }
+        LOG_WARN(ctx, "Metal backend init failed");
+#endif
+        return false;
+    };
+    auto try_vulkan_ctx = [&]() -> bool {
+#ifdef GGML_USE_VULKAN
+        ctx->backend = ggml_backend_vk_init(0);
+        if (ctx->backend) { ctx->gpu_type = voxtral_gpu_backend::vulkan; return true; }
+        LOG_WARN(ctx, "Vulkan backend init failed");
+#endif
+        return false;
+    };
+
+    switch (gpu) {
+        case voxtral_gpu_backend::cuda:    try_cuda_ctx();   break;
+        case voxtral_gpu_backend::metal:   try_metal_ctx();  break;
+        case voxtral_gpu_backend::vulkan:  try_vulkan_ctx(); break;
+        case voxtral_gpu_backend::auto_detect:
+            if (!try_cuda_ctx() && !try_metal_ctx() && !try_vulkan_ctx()) {
+                LOG_INFO(ctx, "no GPU backend available, using CPU");
+            }
+            break;
+        case voxtral_gpu_backend::none:
+        default:
+            break;
+    }
+
+    bool has_gpu = (ctx->gpu_type != voxtral_gpu_backend::none);
+
     if (!ctx->backend) {
         ctx->backend = ggml_backend_cpu_init();
-        ctx->backend_is_cpu = true;
-    } else {
-        ctx->backend_is_cpu = false;
-    }
-
-    if (ctx->backend_is_cpu) {
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
         LOG_INFO(ctx, "backend: CPU with %d threads", ctx->n_threads);
     } else {
         ctx->backend_cpu = ggml_backend_cpu_init();
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-        LOG_INFO(ctx, "backend: METAL (CPU fallback %d threads)", ctx->n_threads);
+        const char * gpu_name = "GPU";
+        if (ctx->gpu_type == voxtral_gpu_backend::cuda)   gpu_name = "CUDA";
+        if (ctx->gpu_type == voxtral_gpu_backend::metal)  gpu_name = "METAL";
+        if (ctx->gpu_type == voxtral_gpu_backend::vulkan) gpu_name = "VULKAN";
+        LOG_INFO(ctx, "backend: %s (CPU fallback %d threads)", gpu_name, ctx->n_threads);
     }
+
+    // Try to init BLAS backend for accelerated CPU matmuls
+#ifdef GGML_USE_BLAS
+    ctx->blas_backend = ggml_backend_blas_init();
+    if (ctx->blas_backend) {
+        ggml_backend_blas_set_n_threads(ctx->blas_backend, ctx->n_threads);
+        LOG_INFO(ctx, "BLAS backend enabled with %d threads", ctx->n_threads);
+    }
+#endif
 
     // Allocate persistent tensors for encoder output, decoder memory, KV cache, logits
     {
@@ -902,14 +1000,21 @@ voxtral_context * voxtral_init_from_model(
             enc_mb, dec_mb, kv_mb);
     }
 
-    // Schedulers (Metal + CPU fallback, or CPU only)
-    ggml_backend_t backends[2];
+    // Schedulers — ggml requires the last backend to be CPU.
+    // With GPU:    [GPU, BLAS?, CPU]
+    // Without GPU: [BLAS?, CPU]  (ctx->backend IS the CPU backend)
+    ggml_backend_t backends[4];
     int n_backends = 0;
-    backends[n_backends++] = ctx->backend;
-    if (!ctx->backend_is_cpu && ctx->backend_cpu) {
-        backends[n_backends++] = ctx->backend_cpu;
+    if (has_gpu) {
+        backends[n_backends++] = ctx->backend;           // GPU first
     }
-    const bool op_offload = !ctx->backend_is_cpu;
+    if (ctx->blas_backend) {
+        backends[n_backends++] = ctx->blas_backend;      // BLAS before CPU
+    }
+    // CPU must be last
+    ggml_backend_t cpu_be = has_gpu ? ctx->backend_cpu : ctx->backend;
+    backends[n_backends++] = cpu_be;
+    const bool op_offload = has_gpu;
 
     ctx->sched_encoder  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
     ctx->sched_adapter  = ggml_backend_sched_new(backends, nullptr, n_backends, GGML_DEFAULT_GRAPH_SIZE, false, op_offload);
@@ -947,6 +1052,7 @@ void voxtral_free(voxtral_context * ctx) {
     if (ctx->sched_dec_step) ggml_backend_sched_free(ctx->sched_dec_step);
     if (ctx->buf_persistent) ggml_backend_buffer_free(ctx->buf_persistent);
     if (ctx->ctx_persistent) ggml_free(ctx->ctx_persistent);
+    if (ctx->blas_backend)   ggml_backend_free(ctx->blas_backend);
     if (ctx->backend_cpu)    ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)        ggml_backend_free(ctx->backend);
     delete ctx;
@@ -1193,6 +1299,9 @@ static ggml_cgraph * build_encoder_graph(
     ggml_set_name(enc_attn_mask, "enc_attn_mask");
     ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_attn_mask, ctx->backend);
 
+    // Cast mask to F16 for flash attention
+    ggml_tensor * enc_attn_mask_f16 = ggml_cast(gctx, enc_attn_mask, GGML_TYPE_F16);
+
     // Transformer layers
     for (int32_t i = 0; i < VOXTRAL_ENC_LAYERS; i++) {
         auto & L = model->enc_layers[i];
@@ -1225,45 +1334,20 @@ static ggml_cgraph * build_encoder_graph(
             VOXTRAL_ENC_HEAD_DIM, 0, 0,
             VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); // [head_dim, n_kv_heads, seq_len]
 
-        // Reshape for attention: [head_dim, n_heads, seq_len] -> permute to [head_dim, seq_len, n_heads]
+        // Flash attention
+        // Q: [head_dim, n_heads, seq_len] -> [head_dim, seq_len, n_heads]
         q = ggml_permute(gctx, q, 0, 2, 1, 3); // [head_dim, seq_len, n_heads]
         k = ggml_permute(gctx, k, 0, 2, 1, 3); // [head_dim, seq_len, n_kv_heads]
 
-        // v: [enc_kv_heads*head_dim, seq_len] -> [head_dim, n_kv_heads, seq_len] -> permute
+        // V: [enc_kv_heads*head_dim, seq_len] -> [head_dim, n_kv_heads, seq_len] -> [head_dim, seq_len, n_kv_heads]
         v = ggml_reshape_3d(gctx, v, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, seq_len);
         v = ggml_permute(gctx, v, 0, 2, 1, 3); // [head_dim, seq_len, n_kv_heads]
-        // For value in attention, we need [head_dim, seq_len, n_kv_heads]
-        // Actually ggml attention: let's use ggml_soft_max_ext + mul_mat manually
 
-        // GQA: expand KV heads if needed
-        // Encoder: ENC_HEADS == ENC_KV_HEADS == 32, so no expansion needed
-
-        // Compute attention scores: Q @ K^T / sqrt(head_dim)
-        // Q: [head_dim, seq_len, n_heads], K: [head_dim, seq_len, n_kv_heads]
-        // ggml_mul_mat over 3D: for each head, Q[head_dim, seq_q] @ K[head_dim, seq_k] -> [seq_k, seq_q]
-        // This is: K^T @ Q -> [seq_k, seq_q] per head
-        ggml_tensor * scores = ggml_mul_mat(gctx, k, q); // [seq_len, seq_len, n_heads]
-
-        // Apply sliding causal mask + scale + softmax in one op
         const float scale = 1.0f / sqrtf((float)VOXTRAL_ENC_HEAD_DIM);
-        scores = ggml_soft_max_ext(gctx, scores, enc_attn_mask, scale, 0.0f); // [seq_len, seq_len, n_heads]
 
-        // Apply attention: scores @ V
-        // V: [head_dim, seq_len, n_heads]
-        // Need V transposed: [seq_len, head_dim, n_heads]
-        ggml_tensor * v_t = ggml_permute(gctx, v, 1, 0, 2, 3); // [seq_len, head_dim, n_heads]
-        // But actually for ggml_mul_mat: A[K,N] @ B[K,M] -> [N,M]
-        // scores: [seq_len(K), seq_len(Q), n_heads]
-        // v: [head_dim, seq_len(V), n_heads] -> we want result [head_dim, seq_q, n_heads]
-        // Use: ggml_mul_mat(v, scores) -> v has [head_dim, seq_v], scores has [seq_v, seq_q]
-        //   -> but v's ne[0]=head_dim, scores's ne[0]=seq_len, mismatch!
-        // Correct: v_t = ggml_cont(permute(v, 1,0,2,3)) -> [seq_len, head_dim, n_heads]
-        // ggml_mul_mat(v_t, scores): v_t[seq_len, head_dim], scores[seq_len, seq_q] -> [head_dim, seq_q]
-        v_t = ggml_cont(gctx, v_t); // make contiguous [seq_len, head_dim, n_heads]
-        ggml_tensor * attn_out = ggml_mul_mat(gctx, v_t, scores); // [head_dim, seq_len, n_heads]
-
-        // Reshape back: [head_dim, seq_len, n_heads] -> permute to [head_dim, n_heads, seq_len]
-        attn_out = ggml_permute(gctx, attn_out, 0, 2, 1, 3); // [head_dim, n_heads, seq_len]
+        // ggml_flash_attn_ext fuses Q@K^T, scale, mask, softmax, @V
+        ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q, k, v, enc_attn_mask_f16, scale, 0.0f, 0.0f);
+        // Output: [head_dim, n_heads, seq_len] (already permuted by flash_attn_ext)
         attn_out = ggml_cont(gctx, attn_out);
         attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_ENC_HEADS * VOXTRAL_ENC_HEAD_DIM, seq_len); // [n_heads*head_dim, seq_len]
 
@@ -1425,47 +1509,27 @@ static ggml_tensor * build_decoder_layer(
         ctx->kv_self_v->nb[1],
         layer_idx * ctx->kv_self_v->nb[2]); // [kv_dim, n_kv]
 
-    // Multi-head attention with GQA
-    // Q: [n_heads*head_dim, n_tokens] -> [head_dim, n_heads, n_tokens] -> permute [head_dim, n_tokens, n_heads]
+    // Flash attention with GQA
+    // Q: [n_heads*head_dim, n_tokens] -> [head_dim, n_heads, n_tokens] -> [head_dim, n_tokens, n_heads]
     ggml_tensor * q3 = ggml_reshape_3d(gctx, q, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_HEADS, n_tokens);
     q3 = ggml_permute(gctx, q3, 0, 2, 1, 3); // [head_dim, n_tokens, n_heads]
 
-    // K: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> permute [head_dim, n_kv, n_kv_heads]
+    // K: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
     ggml_tensor * k3 = ggml_reshape_3d(gctx, k_full, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, n_kv);
     k3 = ggml_permute(gctx, k3, 0, 2, 1, 3); // [head_dim, n_kv, n_kv_heads]
 
-    // V: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> permute [head_dim, n_kv, n_kv_heads]
+    // V: [kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
     ggml_tensor * v3 = ggml_reshape_3d(gctx, v_full, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, n_kv);
     v3 = ggml_permute(gctx, v3, 0, 2, 1, 3); // [head_dim, n_kv, n_kv_heads]
 
-    // GQA: replicate KV heads to match Q heads
-    // dec_heads=32, dec_kv_heads=8, ratio=4
-    // ggml_mul_mat broadcasts: if ne[2] of A < ne[2] of B, A is repeated
-    // So if k3 has ne[2]=n_kv_heads=8 and q3 has ne[2]=n_heads=32, ggml_mul_mat
-    // will automatically broadcast k3 across groups of 4
-
-    // Scores: K^T @ Q -> [n_kv, n_tokens, n_heads]
-    ggml_tensor * scores = ggml_mul_mat(gctx, k3, q3); // [n_kv, n_tokens, n_heads]
-
-    // Scale + mask + softmax
     const float scale = 1.0f / sqrtf((float)VOXTRAL_DEC_HEAD_DIM);
 
-    if (attn_mask) {
-        // Use ggml_soft_max_ext which combines scale + mask + softmax
-        scores = ggml_soft_max_ext(gctx, scores, attn_mask, scale, 0.0f);
-    } else {
-        // For step graph (n_tokens=1), all KV positions are valid (causal by construction)
-        scores = ggml_soft_max_ext(gctx, scores, nullptr, scale, 0.0f);
-    }
-
-    // Attention output: V @ scores^T
-    // V: [head_dim, n_kv, n_kv_heads], scores: [n_kv, n_tokens, n_heads]
-    // v_t: [n_kv, head_dim, n_kv_heads]
-    ggml_tensor * v_t = ggml_cont(gctx, ggml_permute(gctx, v3, 1, 0, 2, 3)); // [n_kv, head_dim, n_kv_heads]
-    ggml_tensor * attn_out = ggml_mul_mat(gctx, v_t, scores); // [head_dim, n_tokens, n_heads]
-
-    // Reshape: [head_dim, n_tokens, n_heads] -> permute [head_dim, n_heads, n_tokens] -> flatten
-    attn_out = ggml_permute(gctx, attn_out, 0, 2, 1, 3); // [head_dim, n_heads, n_tokens]
+    // ggml_flash_attn_ext fuses Q@K^T, scale, mask, softmax, @V in one op
+    // GQA broadcast is built-in (n_heads % n_kv_heads == 0)
+    // Mask is cast to F16 inside the graph if provided
+    ggml_tensor * attn_mask_f16 = attn_mask ? ggml_cast(gctx, attn_mask, GGML_TYPE_F16) : nullptr;
+    ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask_f16, scale, 0.0f, 0.0f);
+    // Output: [head_dim, n_heads, n_tokens] (already permuted by flash_attn_ext)
     attn_out = ggml_cont(gctx, attn_out);
     attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, n_tokens);
 
@@ -1864,19 +1928,22 @@ static bool run_decoder_step(
         ctx->kv_used = VOXTRAL_DEC_WINDOW - 1;
     }
 
+    // Use thread-local buffer to avoid per-step heap allocation
+    static thread_local std::vector<uint8_t> step_meta_buf;
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    if (step_meta_buf.size() < meta_size) {
+        step_meta_buf.resize(meta_size);
+    }
 
     ggml_init_params p = {
         /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
+        /*.mem_buffer=*/ step_meta_buf.data(),
         /*.no_alloc  =*/ true,
     };
     ggml_context * gctx = ggml_init(p);
 
     ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
-    log_graph_info(ctx, "decoder step", gf);
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_step, gf)) {
@@ -1980,14 +2047,18 @@ static bool voxtral_transcribe_from_audio(
     }
 
     // 4. Run encoder
+    auto t_encoder = std::chrono::steady_clock::now();
     if (!run_encoder(&ctx, mel_data.data(), n_frames)) {
         return false;
     }
+    LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
 
     // 5. Run adapter
+    auto t_adapter = std::chrono::steady_clock::now();
     if (!run_adapter(&ctx)) {
         return false;
     }
+    LOG_INFO(&ctx, "adapter time: %.1f ms", elapsed_ms(t_adapter));
 
     const int32_t n_audio = ctx.dec_seq_len;
 
@@ -2010,6 +2081,7 @@ static bool voxtral_transcribe_from_audio(
     clear_kv_cache(&ctx);
 
     // 8. Decoder prefill
+    auto t_prefill = std::chrono::steady_clock::now();
     std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
     if (L > 1) {
         if (!run_decoder_prefill(&ctx, prompt_ids.data(), L - 1, logits.data())) {
@@ -2021,16 +2093,10 @@ static bool voxtral_transcribe_from_audio(
     if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data())) {
         return false;
     }
+    LOG_INFO(&ctx, "prefill time: %.1f ms", elapsed_ms(t_prefill));
 
     // First token from prefill
-    int32_t token = 0;
-    float max_logit = -INFINITY;
-    for (int32_t i = 0; i < VOXTRAL_VOCAB_SIZE; i++) {
-        if (logits[i] > max_logit) {
-            max_logit = logits[i];
-            token = i;
-        }
-    }
+    int32_t token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 
     // Store first step logits
     result.first_step_logits = logits;
@@ -2039,6 +2105,7 @@ static bool voxtral_transcribe_from_audio(
     LOG_INFO(&ctx, "first token: %d", token);
 
     // 9. Autoregressive decoding
+    auto t_decode = std::chrono::steady_clock::now();
     for (int32_t pos = L; pos < n_audio && (int32_t)result.tokens.size() < max_tokens; pos++) {
         if (token == VOXTRAL_TOKEN_EOS) break;
 
@@ -2047,17 +2114,13 @@ static bool voxtral_transcribe_from_audio(
         }
 
         // Greedy argmax
-        token = 0;
-        max_logit = -INFINITY;
-        for (int32_t i = 0; i < VOXTRAL_VOCAB_SIZE; i++) {
-            if (logits[i] > max_logit) {
-                max_logit = logits[i];
-                token = i;
-            }
-        }
+        token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 
         result.tokens.push_back(token);
     }
+    LOG_INFO(&ctx, "decode time: %.1f ms (%d steps, %.1f ms/step)",
+        elapsed_ms(t_decode), (int)result.tokens.size() - 1,
+        result.tokens.size() > 1 ? elapsed_ms(t_decode) / (result.tokens.size() - 1) : 0.0);
 
     // Remove trailing EOS
     if (!result.tokens.empty() && result.tokens.back() == VOXTRAL_TOKEN_EOS) {
