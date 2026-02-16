@@ -18,6 +18,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -35,9 +36,9 @@
 static constexpr float VOXTRAL_PI = 3.14159265358979323846f;
 static constexpr int32_t VOXTRAL_N_FFT       = VOXTRAL_WINDOW_SIZE;         // 400
 static constexpr int32_t VOXTRAL_N_FREQ      = VOXTRAL_N_FFT / 2 + 1;      // 201
-static constexpr int32_t VOXTRAL_MAX_MEL_FRAMES = 4000;
-static constexpr int32_t VOXTRAL_MAX_ENC_SEQ = VOXTRAL_MAX_MEL_FRAMES / 2;  // after conv stride-2
-static constexpr int32_t VOXTRAL_MAX_DEC_SEQ = VOXTRAL_MAX_ENC_SEQ / VOXTRAL_DOWNSAMPLE_FACTOR;
+static constexpr int32_t VOXTRAL_ENC_CHUNK_MEL     = 3000;  // mel frames per encoder chunk
+static constexpr int32_t VOXTRAL_ENC_CHUNK_OVERLAP  = 750;  // overlap in encoder-token space (= window)
+static constexpr int32_t VOXTRAL_MAX_ENC_CHUNK      = 2000; // max enc tokens per single chunk
 
 // ============================================================================
 // Logging helper
@@ -148,16 +149,27 @@ struct voxtral_context {
     voxtral_gpu_backend    gpu_type     = voxtral_gpu_backend::none;
 
     // Persistent device tensors (allocated once)
-    ggml_context  * ctx_persistent = nullptr;
-    ggml_backend_buffer_t  buf_persistent = nullptr;
+    ggml_context       * ctx_persistent = nullptr;
+    ggml_backend_buffer_t buf_persistent = nullptr;
 
-    ggml_tensor * encoder_output  = nullptr;  // [enc_dim, max_enc_seq]
-    ggml_tensor * decoder_memory  = nullptr;  // [dec_dim, max_dec_seq]
+    // Per-chunk encoder output (fixed size, reused each chunk)
+    ggml_tensor * encoder_chunk_output = nullptr;  // [enc_dim, MAX_ENC_CHUNK]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
     ggml_tensor * kv_self_v       = nullptr;
+
+    // Full accumulated encoder output (dynamic, allocated per utterance ON DEVICE)
+    ggml_context       * ctx_enc_full = nullptr;
+    ggml_backend_buffer_t buf_enc_full = nullptr;
+    ggml_tensor        * encoder_output = nullptr;  // [enc_dim, total_enc_tokens]
+    int32_t total_enc_tokens = 0;
+
+    // Dynamic decoder memory (allocated per utterance ON DEVICE)
+    ggml_context       * ctx_dec_mem = nullptr;
+    ggml_backend_buffer_t buf_dec_mem = nullptr;
+    ggml_tensor        * decoder_memory = nullptr;  // [dec_dim, dec_seq]
 
     // Actual sizes (set per utterance)
     int32_t enc_seq_len  = 0;  // after conv, before left-trunc
@@ -946,9 +958,9 @@ voxtral_context * voxtral_init_from_model(
     }
 #endif
 
-    // Allocate persistent tensors for encoder output, decoder memory, KV cache, logits
+    // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
-        constexpr size_t n_tensors = 5;
+        constexpr size_t n_tensors = 4;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -956,15 +968,10 @@ voxtral_context * voxtral_init_from_model(
         };
         ctx->ctx_persistent = ggml_init(p);
 
-        // encoder_output: [enc_dim, max_enc_seq]  (transposed: ne[0]=enc_dim rows)
-        ctx->encoder_output = ggml_new_tensor_2d(ctx->ctx_persistent, GGML_TYPE_F32,
-            VOXTRAL_ENC_DIM, VOXTRAL_MAX_ENC_SEQ);
-        ggml_set_name(ctx->encoder_output, "encoder_output");
-
-        // decoder_memory: [dec_dim, max_dec_seq]
-        ctx->decoder_memory = ggml_new_tensor_2d(ctx->ctx_persistent, GGML_TYPE_F32,
-            VOXTRAL_DEC_DIM, VOXTRAL_MAX_DEC_SEQ);
-        ggml_set_name(ctx->decoder_memory, "decoder_memory");
+        // encoder_chunk_output: [enc_dim, MAX_ENC_CHUNK] (reused per chunk)
+        ctx->encoder_chunk_output = ggml_new_tensor_2d(ctx->ctx_persistent, GGML_TYPE_F32,
+            VOXTRAL_ENC_DIM, VOXTRAL_MAX_ENC_CHUNK);
+        ggml_set_name(ctx->encoder_chunk_output, "encoder_chunk_output");
 
         // decoder_logits: [vocab_size]
         ctx->decoder_logits = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_F32,
@@ -988,16 +995,15 @@ voxtral_context * voxtral_init_from_model(
             return nullptr;
         }
 
-        // Zero KV cache
+        // Zero persistent buffer (KV cache etc.)
         ggml_backend_buffer_clear(ctx->buf_persistent, 0);
     }
 
     {
-        const double enc_mb = (double) ggml_nbytes(ctx->encoder_output) / 1e6;
-        const double dec_mb = (double) ggml_nbytes(ctx->decoder_memory) / 1e6;
+        const double chunk_mb = (double) ggml_nbytes(ctx->encoder_chunk_output) / 1e6;
         const double kv_mb  = (double) (ggml_nbytes(ctx->kv_self_k) + ggml_nbytes(ctx->kv_self_v)) / 1e6;
-        LOG_INFO(ctx, "buffers: encoder_output=%.2f MB decoder_memory=%.2f MB kv_cache=%.2f MB",
-            enc_mb, dec_mb, kv_mb);
+        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB kv_cache=%.2f MB",
+            chunk_mb, kv_mb);
     }
 
     // Schedulers — ggml requires the last backend to be CPU.
@@ -1050,6 +1056,10 @@ void voxtral_free(voxtral_context * ctx) {
     if (ctx->sched_adapter)  ggml_backend_sched_free(ctx->sched_adapter);
     if (ctx->sched_dec_pre)  ggml_backend_sched_free(ctx->sched_dec_pre);
     if (ctx->sched_dec_step) ggml_backend_sched_free(ctx->sched_dec_step);
+    if (ctx->buf_enc_full)   ggml_backend_buffer_free(ctx->buf_enc_full);
+    if (ctx->ctx_enc_full)   ggml_free(ctx->ctx_enc_full);
+    if (ctx->buf_dec_mem)    ggml_backend_buffer_free(ctx->buf_dec_mem);
+    if (ctx->ctx_dec_mem)    ggml_free(ctx->ctx_dec_mem);
     if (ctx->buf_persistent) ggml_backend_buffer_free(ctx->buf_persistent);
     if (ctx->ctx_persistent) ggml_free(ctx->ctx_persistent);
     if (ctx->blas_backend)   ggml_backend_free(ctx->blas_backend);
@@ -1139,6 +1149,79 @@ causal_conv1d_dims compute_causal_conv1d_dims(int32_t in_len, int32_t kernel_siz
     return out;
 }
 
+// Compute the number of encoder tokens from mel frames (accounting for conv and truncation)
+static int32_t mel_frames_to_enc_tokens(int32_t n_frames) {
+    auto d0 = compute_causal_conv1d_dims(n_frames, 3, 1);  // conv0
+    auto d1 = compute_causal_conv1d_dims(d0.out_len, 3, 2); // conv1 (stride 2)
+    int32_t trunc = d1.out_len % VOXTRAL_DOWNSAMPLE_FACTOR;
+    return d1.out_len - trunc;
+}
+
+// Pre-compute total encoder tokens for a given mel frame count (for buffer allocation)
+static int32_t compute_total_enc_tokens(int32_t total_mel_frames) {
+    const int32_t mel_stride = VOXTRAL_ENC_CHUNK_MEL - VOXTRAL_ENC_CHUNK_OVERLAP * 2;
+    int32_t total = 0;
+    int32_t mel_offset = 0;
+    bool first = true;
+
+    while (mel_offset < total_mel_frames) {
+        int32_t chunk_mel = std::min(VOXTRAL_ENC_CHUNK_MEL, total_mel_frames - mel_offset);
+        int32_t chunk_tokens = mel_frames_to_enc_tokens(chunk_mel);
+        int32_t skip = first ? 0 : VOXTRAL_ENC_CHUNK_OVERLAP;
+        int32_t stride = chunk_tokens - skip;
+        if (stride <= 0) break;
+        total += stride;
+        mel_offset += mel_stride;
+        first = false;
+    }
+    return total;
+}
+
+// Allocate per-utterance encoder output buffer on device
+static bool alloc_encoder_output(voxtral_context * ctx, int32_t n_tokens) {
+    // Free previous allocation
+    if (ctx->buf_enc_full) { ggml_backend_buffer_free(ctx->buf_enc_full); ctx->buf_enc_full = nullptr; }
+    if (ctx->ctx_enc_full) { ggml_free(ctx->ctx_enc_full); ctx->ctx_enc_full = nullptr; }
+    ctx->encoder_output = nullptr;
+
+    ggml_init_params p = {
+        /*.mem_size  =*/ ggml_tensor_overhead(),
+        /*.mem_buffer=*/ nullptr,
+        /*.no_alloc  =*/ true,
+    };
+    ctx->ctx_enc_full = ggml_init(p);
+    ctx->encoder_output = ggml_new_tensor_2d(ctx->ctx_enc_full, GGML_TYPE_F32,
+        VOXTRAL_ENC_DIM, n_tokens);
+    ggml_set_name(ctx->encoder_output, "encoder_output");
+    ctx->buf_enc_full = ggml_backend_alloc_ctx_tensors(ctx->ctx_enc_full, ctx->backend);
+    if (!ctx->buf_enc_full) return false;
+
+    ctx->total_enc_tokens = n_tokens;
+    return true;
+}
+
+// Allocate per-utterance decoder memory buffer on device
+static bool alloc_decoder_memory(voxtral_context * ctx, int32_t dec_seq) {
+    if (ctx->buf_dec_mem) { ggml_backend_buffer_free(ctx->buf_dec_mem); ctx->buf_dec_mem = nullptr; }
+    if (ctx->ctx_dec_mem) { ggml_free(ctx->ctx_dec_mem); ctx->ctx_dec_mem = nullptr; }
+    ctx->decoder_memory = nullptr;
+
+    ggml_init_params p = {
+        /*.mem_size  =*/ ggml_tensor_overhead(),
+        /*.mem_buffer=*/ nullptr,
+        /*.no_alloc  =*/ true,
+    };
+    ctx->ctx_dec_mem = ggml_init(p);
+    ctx->decoder_memory = ggml_new_tensor_2d(ctx->ctx_dec_mem, GGML_TYPE_F32,
+        VOXTRAL_DEC_DIM, dec_seq);
+    ggml_set_name(ctx->decoder_memory, "decoder_memory");
+    ctx->buf_dec_mem = ggml_backend_alloc_ctx_tensors(ctx->ctx_dec_mem, ctx->backend);
+    if (!ctx->buf_dec_mem) return false;
+
+    ctx->dec_seq_len = dec_seq;
+    return true;
+}
+
 ggml_tensor * causal_conv1d_graph(
     ggml_context * ctx0,
     ggml_tensor * x,
@@ -1185,8 +1268,8 @@ void print_tensor_info(struct ggml_tensor * tensor) {
     printf("Tensor name: %s\n", tensor->name);
     printf("Tensor type: %s\n", ggml_type_name(tensor->type));
     printf("Number of dimensions: %d\n", ggml_n_dims(tensor));
-    printf("Total elements: %ld \n", ggml_nelements(tensor));
-    printf("Shape: [%ld , %ld, %ld, %ld]\n",
+    printf("Total elements: %" PRId64 "\n", ggml_nelements(tensor));
+    printf("Shape: [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 }
 
@@ -1195,11 +1278,11 @@ static void log_tensor_info(voxtral_context * ctx, const char * tag, struct ggml
         LOG_DBG(ctx, "%s: <null>", tag);
         return;
     }
-    LOG_DBG(ctx, "%s: type=%s ne=[%ld,%ld,%ld,%ld] nb=[%ld,%ld,%ld,%ld] n_dims=%d nbytes=%zu",
+    LOG_DBG(ctx, "%s: type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] n_dims=%d nbytes=%zu",
         tag,
         ggml_type_name(t->type),
         t->ne[0], t->ne[1], t->ne[2], t->ne[3],
-        t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+        (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3],
         ggml_n_dims(t),
         (size_t) ggml_nbytes(t));
 }
@@ -1213,12 +1296,13 @@ static void log_graph_info(voxtral_context * ctx, const char * name, struct ggml
     LOG_INFO(ctx, "%s graph: size=%d nodes=%d", name, size, nodes);
 }
 
-// Build encoder graph that writes output into ctx->encoder_output
+// Build encoder graph that writes output into ctx->encoder_chunk_output
 static ggml_cgraph * build_encoder_graph(
     voxtral_context * ctx,
     ggml_context * gctx,
     const float * mel_data,   // [n_mel, n_frames] on CPU
-    int32_t n_frames)
+    int32_t n_frames,
+    int32_t * out_seq_len)    // output: encoder tokens produced by this chunk
 {
     LOG_DBG(ctx, "Building encoder graph");
     voxtral_model * model = ctx->model;
@@ -1376,15 +1460,14 @@ static ggml_cgraph * build_encoder_graph(
     x = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS); // [enc_dim, seq_len]
     x = ggml_mul(gctx, x, model->enc_norm_weight); // [enc_dim, seq_len]
 
-    // Copy result to persistent encoder_output
-    ggml_tensor * enc_out_view = ggml_view_2d(gctx, ctx->encoder_output,
+    // Copy result to encoder_chunk_output (per-chunk buffer, reused each chunk)
+    ggml_tensor * enc_out_view = ggml_view_2d(gctx, ctx->encoder_chunk_output,
         VOXTRAL_ENC_DIM, seq_len,
-        ctx->encoder_output->nb[1], 0); // [enc_dim, seq_len]
+        ctx->encoder_chunk_output->nb[1], 0); // [enc_dim, seq_len]
     ggml_tensor * cpy = ggml_cpy(gctx, x, enc_out_view);
     ggml_build_forward_expand(gf, cpy);
 
-    ctx->enc_seq_len  = conv_out_len;
-    ctx->enc_seq_used = seq_len;
+    if (out_seq_len) *out_seq_len = seq_len;
 
     return gf;
 }
@@ -1706,9 +1789,14 @@ static ggml_tensor * find_tensor_in_graph(ggml_cgraph * gf, const char * name) {
 // Run Encoder
 // ============================================================================
 
-static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n_frames) {
-    LOG_INFO(ctx, "running encoder: %d mel frames", n_frames);
-
+// Run a single encoder chunk: build graph, set inputs, compute, return seq_len
+static bool run_encoder_chunk(
+    voxtral_context * ctx,
+    const float * chunk_mel_data,  // [n_mel, chunk_mel_frames]
+    int32_t chunk_mel_frames,
+    int32_t rope_pos_offset,
+    int32_t * out_seq_len)
+{
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
     std::vector<uint8_t> meta_buf(meta_size);
@@ -1720,65 +1808,57 @@ static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n
     };
     ggml_context * gctx = ggml_init(p);
 
-    ggml_cgraph * gf = build_encoder_graph(ctx, gctx, mel_data, n_frames);
-    log_graph_info(ctx, "encoder", gf);
+    int32_t chunk_seq_len = 0;
+    ggml_cgraph * gf = build_encoder_graph(ctx, gctx, chunk_mel_data, chunk_mel_frames, &chunk_seq_len);
 
-    // Allocate
-    LOG_DBG(ctx, "Allocating scheduler for the encoder");
     ggml_backend_sched_reset(ctx->sched_encoder);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_encoder, gf)) {
-        LOG_ERR(ctx, "encoder: failed to allocate graph");
+        LOG_ERR(ctx, "encoder chunk: failed to allocate graph");
         ggml_free(gctx);
         return false;
     }
 
-    // Set input data: mel_input
+    // Set mel input
     ggml_tensor * mel_t = find_tensor_in_graph(gf, "mel_input");
     if (mel_t) {
-        log_tensor_info(ctx, "mel_input(runtime)", mel_t);
-        const int64_t expected_ne0 = n_frames;              // length
-        const int64_t expected_ne1 = VOXTRAL_NUM_MEL_BINS;  // channels
+        const int64_t expected_ne0 = chunk_mel_frames;
+        const int64_t expected_ne1 = VOXTRAL_NUM_MEL_BINS;
         if (mel_t->ne[0] == expected_ne0 && mel_t->ne[1] == expected_ne1) {
-            // mel_data layout [n_mel, n_frames] matches ggml [length, channels] memory order.
-            ggml_backend_tensor_set(mel_t, mel_data, 0,
-                (size_t) VOXTRAL_NUM_MEL_BINS * n_frames * sizeof(float));
+            ggml_backend_tensor_set(mel_t, chunk_mel_data, 0,
+                (size_t) VOXTRAL_NUM_MEL_BINS * chunk_mel_frames * sizeof(float));
         } else if (mel_t->ne[0] == expected_ne1 && mel_t->ne[1] == expected_ne0) {
-            // If tensor expects [n_mel, n_frames], transpose from mel_data.
-            std::vector<float> mel_tbuf((size_t) n_frames * VOXTRAL_NUM_MEL_BINS);
+            std::vector<float> mel_tbuf((size_t) chunk_mel_frames * VOXTRAL_NUM_MEL_BINS);
             for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; ++m) {
-                const float * src = mel_data + (size_t) m * n_frames;
-                for (int32_t f = 0; f < n_frames; ++f) {
+                const float * src = chunk_mel_data + (size_t) m * chunk_mel_frames;
+                for (int32_t f = 0; f < chunk_mel_frames; ++f) {
                     mel_tbuf[(size_t) m + (size_t) VOXTRAL_NUM_MEL_BINS * f] = src[f];
                 }
             }
             ggml_backend_tensor_set(mel_t, mel_tbuf.data(), 0,
-                (size_t) VOXTRAL_NUM_MEL_BINS * n_frames * sizeof(float));
+                (size_t) VOXTRAL_NUM_MEL_BINS * chunk_mel_frames * sizeof(float));
         } else {
-            // Fallback: assume mel_data layout matches tensor shape and size
-            ggml_backend_tensor_set(mel_t, mel_data, 0,
-                (size_t) VOXTRAL_NUM_MEL_BINS * n_frames * sizeof(float));
+            ggml_backend_tensor_set(mel_t, chunk_mel_data, 0,
+                (size_t) VOXTRAL_NUM_MEL_BINS * chunk_mel_frames * sizeof(float));
         }
     }
 
-    // Set positions: 0, 1, 2, ..., seq_len-1
+    // Set positions with RoPE offset for absolute positions across chunks
     ggml_tensor * pos_t = find_tensor_in_graph(gf, "enc_positions");
     if (pos_t) {
-        const int32_t seq_len = ctx->enc_seq_used;
-        std::vector<int32_t> pos(seq_len);
-        std::iota(pos.begin(), pos.end(), 0);
-        ggml_backend_tensor_set(pos_t, pos.data(), 0, seq_len * sizeof(int32_t));
+        std::vector<int32_t> pos(chunk_seq_len);
+        std::iota(pos.begin(), pos.end(), rope_pos_offset);
+        ggml_backend_tensor_set(pos_t, pos.data(), 0, chunk_seq_len * sizeof(int32_t));
     }
 
-    // Set encoder sliding causal mask
+    // Set encoder sliding causal mask (local to chunk)
     ggml_tensor * mask_t = find_tensor_in_graph(gf, "enc_attn_mask");
     if (mask_t) {
-        const int32_t seq_len = ctx->enc_seq_used;
-        std::vector<float> mask((size_t) seq_len * seq_len);
-        for (int32_t q = 0; q < seq_len; ++q) {
+        std::vector<float> mask((size_t) chunk_seq_len * chunk_seq_len);
+        for (int32_t q = 0; q < chunk_seq_len; ++q) {
             const int32_t min_kv = std::max<int32_t>(0, q - (VOXTRAL_ENC_WINDOW - 1));
-            for (int32_t kv = 0; kv < seq_len; ++kv) {
+            for (int32_t kv = 0; kv < chunk_seq_len; ++kv) {
                 const bool allow = (kv <= q) && (kv >= min_kv);
-                mask[(size_t) q * seq_len + kv] = allow ? 0.0f : -INFINITY;
+                mask[(size_t) q * chunk_seq_len + kv] = allow ? 0.0f : -INFINITY;
             }
         }
         ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
@@ -1789,7 +1869,118 @@ static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n
     ggml_backend_sched_reset(ctx->sched_encoder);
     ggml_free(gctx);
 
-    LOG_INFO(ctx, "encoder done: enc_seq_used=%d", ctx->enc_seq_used);
+    if (out_seq_len) *out_seq_len = chunk_seq_len;
+    return true;
+}
+
+// Process mel spectrogram in overlapping chunks, accumulating encoder output on device
+static bool run_encoder_chunked(voxtral_context * ctx, const float * mel_data, int32_t total_mel_frames) {
+    const int32_t mel_overlap = VOXTRAL_ENC_CHUNK_OVERLAP * 2;  // mel frames of overlap (1500)
+    const int32_t mel_stride = VOXTRAL_ENC_CHUNK_MEL - mel_overlap;  // 1500
+
+    // Pre-compute total encoder tokens for allocation
+    int32_t alloc_total = compute_total_enc_tokens(total_mel_frames);
+    if (alloc_total <= 0) {
+        LOG_ERR(ctx, "encoder: audio too short to produce encoder tokens");
+        return false;
+    }
+
+    // Allocate encoder_output on device
+    if (!alloc_encoder_output(ctx, alloc_total)) {
+        LOG_ERR(ctx, "encoder: failed to allocate encoder output (%d tokens, %.2f MB)",
+                alloc_total, (double) alloc_total * VOXTRAL_ENC_DIM * sizeof(float) / 1e6);
+        return false;
+    }
+
+    LOG_INFO(ctx, "encoder chunked: %d mel frames, %d alloc enc tokens, mel_stride=%d",
+             total_mel_frames, alloc_total, mel_stride);
+
+    int32_t mel_offset = 0;
+    int32_t enc_write_offset = 0;
+    int32_t chunk_idx = 0;
+
+    while (mel_offset < total_mel_frames) {
+        int32_t chunk_mel_frames = std::min(VOXTRAL_ENC_CHUNK_MEL, total_mel_frames - mel_offset);
+
+        // Pre-check: will this chunk contribute any new tokens?
+        // This avoids building and running the full encoder graph for nothing.
+        int32_t skip = (chunk_idx > 0) ? VOXTRAL_ENC_CHUNK_OVERLAP : 0;
+        {
+            int32_t expected_tokens = mel_frames_to_enc_tokens(chunk_mel_frames);
+            if (expected_tokens - skip <= 0) {
+                LOG_DBG(ctx, "encoder chunk %d: skipped (expected %d tokens, skip=%d)",
+                        chunk_idx, expected_tokens, skip);
+                break;
+            }
+        }
+
+        // For single-chunk case (entire mel fits), use mel_data directly to avoid copy
+        const float * chunk_mel_ptr = nullptr;
+        std::vector<float> chunk_mel_buf;
+        if (mel_offset == 0 && chunk_mel_frames == total_mel_frames) {
+            // Single chunk — mel_data is already in [n_mel, total_frames] layout
+            chunk_mel_ptr = mel_data;
+        } else {
+            // Multi-chunk — extract sub-range of frames for this chunk
+            chunk_mel_buf.resize((size_t) VOXTRAL_NUM_MEL_BINS * chunk_mel_frames);
+            for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++) {
+                memcpy(chunk_mel_buf.data() + (size_t) m * chunk_mel_frames,
+                       mel_data + (size_t) m * total_mel_frames + mel_offset,
+                       chunk_mel_frames * sizeof(float));
+            }
+            chunk_mel_ptr = chunk_mel_buf.data();
+        }
+
+        int32_t rope_offset = enc_write_offset - skip;
+
+        // Run encoder for this chunk
+        int32_t chunk_seq_len = 0;
+        if (!run_encoder_chunk(ctx, chunk_mel_ptr, chunk_mel_frames, rope_offset, &chunk_seq_len)) {
+            LOG_ERR(ctx, "encoder chunk %d: failed", chunk_idx);
+            return false;
+        }
+
+        int32_t stride = chunk_seq_len - skip;
+        if (stride <= 0) {
+            LOG_DBG(ctx, "encoder chunk %d: no new tokens (seq_len=%d, skip=%d), stopping",
+                    chunk_idx, chunk_seq_len, skip);
+            break;
+        }
+
+        // Clamp stride to not overflow pre-allocated buffer
+        if (enc_write_offset + stride > alloc_total) {
+            stride = alloc_total - enc_write_offset;
+            if (stride <= 0) break;
+        }
+
+        LOG_INFO(ctx, "encoder chunk %d: mel[%d..%d) enc_tokens=%d skip=%d stride=%d rope_offset=%d",
+                 chunk_idx, mel_offset, mel_offset + chunk_mel_frames,
+                 chunk_seq_len, skip, stride, rope_offset);
+
+        // Copy stride portion from encoder_chunk_output to encoder_output
+        // Goes through CPU (device->CPU->device), but stride data is small (~3.8 MB max)
+        {
+            const size_t elem_bytes = VOXTRAL_ENC_DIM * sizeof(float);
+            const size_t src_offset = (size_t) skip * elem_bytes;
+            const size_t dst_offset = (size_t) enc_write_offset * elem_bytes;
+            const size_t copy_bytes = (size_t) stride * elem_bytes;
+
+            std::vector<uint8_t> tmp(copy_bytes);
+            ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
+            ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
+        }
+
+        enc_write_offset += stride;
+        mel_offset += mel_stride;
+        chunk_idx++;
+    }
+
+    // Trim to multiple of downsample factor for adapter compatibility
+    ctx->enc_seq_used = (enc_write_offset / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+    ctx->total_enc_tokens = ctx->enc_seq_used;
+
+    LOG_INFO(ctx, "encoder done: %d chunks, enc_seq_used=%d (raw=%d)",
+             chunk_idx, ctx->enc_seq_used, enc_write_offset);
     return true;
 }
 
@@ -1798,7 +1989,17 @@ static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n
 // ============================================================================
 
 static bool run_adapter(voxtral_context * ctx) {
-    LOG_INFO(ctx, "running adapter");
+    const int32_t enc_seq = ctx->enc_seq_used;
+    const int32_t dec_seq = enc_seq / VOXTRAL_DOWNSAMPLE_FACTOR;
+
+    LOG_INFO(ctx, "running adapter: enc_seq=%d -> dec_seq=%d", enc_seq, dec_seq);
+
+    // Allocate decoder_memory for this utterance
+    if (!alloc_decoder_memory(ctx, dec_seq)) {
+        LOG_ERR(ctx, "adapter: failed to allocate decoder memory (%d tokens, %.2f MB)",
+                dec_seq, (double) dec_seq * VOXTRAL_DEC_DIM * sizeof(float) / 1e6);
+        return false;
+    }
 
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, false);
@@ -1825,7 +2026,9 @@ static bool run_adapter(voxtral_context * ctx) {
     ggml_backend_sched_reset(ctx->sched_adapter);
     ggml_free(gctx);
 
-    LOG_INFO(ctx, "adapter done: dec_seq_len=%d", ctx->dec_seq_len);
+    LOG_INFO(ctx, "adapter done: dec_seq_len=%d (%.2f MB on device)",
+             ctx->dec_seq_len,
+             (double) ggml_nbytes(ctx->decoder_memory) / 1e6);
     return true;
 }
 
@@ -2046,9 +2249,9 @@ static bool voxtral_transcribe_from_audio(
         LOG_INFO(&ctx, "mel truncated to %d frames (even)", n_frames);
     }
 
-    // 4. Run encoder
+    // 4. Run encoder (chunked for arbitrarily long audio)
     auto t_encoder = std::chrono::steady_clock::now();
-    if (!run_encoder(&ctx, mel_data.data(), n_frames)) {
+    if (!run_encoder_chunked(&ctx, mel_data.data(), n_frames)) {
         return false;
     }
     LOG_INFO(&ctx, "encoder time: %.1f ms", elapsed_ms(t_encoder));
@@ -2106,6 +2309,8 @@ static bool voxtral_transcribe_from_audio(
 
     // 9. Autoregressive decoding
     auto t_decode = std::chrono::steady_clock::now();
+    int32_t consecutive_pad = 0;
+    bool seen_text = false;
     for (int32_t pos = L; pos < n_audio && (int32_t)result.tokens.size() < max_tokens; pos++) {
         if (token == VOXTRAL_TOKEN_EOS) break;
 
@@ -2117,6 +2322,21 @@ static bool voxtral_transcribe_from_audio(
         token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 
         result.tokens.push_back(token);
+
+        // Early stopping: if we've seen real text and then get enough
+        // consecutive streaming pad tokens, the transcript is complete.
+        if (token == VOXTRAL_TOKEN_STREAMING_PAD) {
+            consecutive_pad++;
+        } else {
+            consecutive_pad = 0;
+            if (token >= ctx.model->tokenizer_num_special_tokens) {
+                seen_text = true;
+            }
+        }
+        if (seen_text && consecutive_pad >= VOXTRAL_N_RIGHT_PAD_TOKENS) {
+            LOG_INFO(&ctx, "early stop: %d consecutive pad tokens after text", consecutive_pad);
+            break;
+        }
     }
     LOG_INFO(&ctx, "decode time: %.1f ms (%d steps, %.1f ms/step)",
         elapsed_ms(t_decode), (int)result.tokens.size() - 1,
