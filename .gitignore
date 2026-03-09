@@ -42,6 +42,7 @@ _deps/
 
 # Build directories
 [Bb]uild/
+build-*/
 [Oo]ut/
 [Bb]in/
 

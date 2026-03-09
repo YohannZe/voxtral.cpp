@@ -152,6 +152,44 @@ bool voxtral_transcribe_audio(
     int32_t            max_tokens,
     voxtral_result   & result);
 
+// ============================================================================
+// Streaming API
+// ============================================================================
+
+// Max audio duration for streaming (seconds). Pre-allocates buffers.
+#define VOXTRAL_STREAM_MAX_AUDIO_SEC  120
+
+struct voxtral_stream;
+
+// Create a streaming session. Call voxtral_stream_reset before first use.
+voxtral_stream * voxtral_stream_create(voxtral_context * ctx);
+
+// Free streaming session.
+void voxtral_stream_free(voxtral_stream * stream);
+
+// Reset stream state for a new utterance.
+void voxtral_stream_reset(voxtral_stream * stream);
+
+// Warm up the stream by running a dummy encode/adapter/prefill pass.
+// Call once after create to eliminate cold start latency on first real audio.
+// Resets the stream afterwards so it's ready for real use.
+bool voxtral_stream_warmup(voxtral_stream * stream);
+
+// Feed new audio samples (16kHz float32 mono).
+// Returns new transcribed text since last call (may be empty if no new text yet).
+// Returns false on error.
+bool voxtral_stream_feed(
+    voxtral_stream * stream,
+    const float    * audio,
+    int32_t          n_samples,
+    std::string    & new_text);
+
+// Flush remaining text (call when audio stream ends).
+// Adds right padding to get final delayed tokens.
+bool voxtral_stream_flush(
+    voxtral_stream * stream,
+    std::string    & remaining_text);
+
 #endif // __cplusplus
 
 #endif // VOXTRAL_H

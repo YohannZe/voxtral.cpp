@@ -156,9 +156,13 @@ struct voxtral_context {
     ggml_tensor * encoder_chunk_output = nullptr;  // [enc_dim, MAX_ENC_CHUNK]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
 
-    // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
+    // Decoder KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
     ggml_tensor * kv_self_v       = nullptr;
+
+    // Encoder KV cache (streaming): [enc_kv_dim, enc_window, enc_layers]
+    ggml_tensor * enc_kv_k        = nullptr;
+    ggml_tensor * enc_kv_v        = nullptr;
 
     // Full accumulated encoder output (dynamic, allocated per utterance ON DEVICE)
     ggml_context       * ctx_enc_full = nullptr;
@@ -960,7 +964,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors: encoder chunk output, decoder logits, KV cache
     {
-        constexpr size_t n_tensors = 4;
+        constexpr size_t n_tensors = 6;  // chunk_output + logits + dec_kv(2) + enc_kv(2)
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -978,7 +982,7 @@ voxtral_context * voxtral_init_from_model(
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
 
-        // KV cache: [kv_dim, dec_window, dec_layers]
+        // Decoder KV cache: [kv_dim, dec_window, dec_layers]
         const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM;  // 1024
         ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
             kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
@@ -987,6 +991,16 @@ voxtral_context * voxtral_init_from_model(
         ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
             kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
         ggml_set_name(ctx->kv_self_v, "kv_self_v");
+
+        // Encoder KV cache (streaming): [enc_kv_dim, enc_window, enc_layers]
+        const int32_t enc_kv_dim = VOXTRAL_ENC_KV_HEADS * VOXTRAL_ENC_HEAD_DIM;  // 2048
+        ctx->enc_kv_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
+            enc_kv_dim, VOXTRAL_ENC_WINDOW, VOXTRAL_ENC_LAYERS);
+        ggml_set_name(ctx->enc_kv_k, "enc_kv_k");
+
+        ctx->enc_kv_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
+            enc_kv_dim, VOXTRAL_ENC_WINDOW, VOXTRAL_ENC_LAYERS);
+        ggml_set_name(ctx->enc_kv_v, "enc_kv_v");
 
         ctx->buf_persistent = ggml_backend_alloc_ctx_tensors(ctx->ctx_persistent, ctx->backend);
         if (!ctx->buf_persistent) {
@@ -1002,8 +1016,9 @@ voxtral_context * voxtral_init_from_model(
     {
         const double chunk_mb = (double) ggml_nbytes(ctx->encoder_chunk_output) / 1e6;
         const double kv_mb  = (double) (ggml_nbytes(ctx->kv_self_k) + ggml_nbytes(ctx->kv_self_v)) / 1e6;
-        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB kv_cache=%.2f MB",
-            chunk_mb, kv_mb);
+        const double enc_kv_mb = (double) (ggml_nbytes(ctx->enc_kv_k) + ggml_nbytes(ctx->enc_kv_v)) / 1e6;
+        LOG_INFO(ctx, "buffers: encoder_chunk=%.2f MB dec_kv=%.2f MB enc_kv=%.2f MB",
+            chunk_mb, kv_mb, enc_kv_mb);
     }
 
     // Schedulers — ggml requires the last backend to be CPU.
@@ -1115,6 +1130,40 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
 
         memset(k_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
         memset(v_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
+    }
+}
+
+// Encoder KV cache helpers
+
+static void clear_enc_kv_cache(voxtral_context * ctx) {
+    if (!ctx || !ctx->enc_kv_k || !ctx->enc_kv_v) return;
+    void * k_data = ggml_get_data(ctx->enc_kv_k);
+    void * v_data = ggml_get_data(ctx->enc_kv_v);
+    if (k_data) memset(k_data, 0, ggml_nbytes(ctx->enc_kv_k));
+    if (v_data) memset(v_data, 0, ggml_nbytes(ctx->enc_kv_v));
+}
+
+static void enc_kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
+    if (!ctx || shift <= 0 || !ctx->enc_kv_k || !ctx->enc_kv_v) return;
+    if (shift >= VOXTRAL_ENC_WINDOW) {
+        clear_enc_kv_cache(ctx);
+        return;
+    }
+    uint8_t * k_data = (uint8_t *) ggml_get_data(ctx->enc_kv_k);
+    uint8_t * v_data = (uint8_t *) ggml_get_data(ctx->enc_kv_v);
+    if (!k_data || !v_data) return;
+
+    const size_t row_bytes    = ctx->enc_kv_k->nb[1];
+    const size_t layer_stride = ctx->enc_kv_k->nb[2];
+
+    for (int32_t l = 0; l < VOXTRAL_ENC_LAYERS; ++l) {
+        uint8_t * k_base = k_data + (size_t)l * layer_stride;
+        uint8_t * v_base = v_data + (size_t)l * layer_stride;
+        const int32_t keep = VOXTRAL_ENC_WINDOW - shift;
+        memmove(k_base, k_base + (size_t)shift * row_bytes, (size_t)keep * row_bytes);
+        memmove(v_base, v_base + (size_t)shift * row_bytes, (size_t)keep * row_bytes);
+        memset(k_base + (size_t)keep * row_bytes, 0, (size_t)shift * row_bytes);
+        memset(v_base + (size_t)keep * row_bytes, 0, (size_t)shift * row_bytes);
     }
 }
 
@@ -1473,6 +1522,304 @@ static ggml_cgraph * build_encoder_graph(
 }
 
 // ============================================================================
+// Graph Building: Encoder with KV cache (streaming)
+// ============================================================================
+//
+// Same conv stem as build_encoder_graph, but transformer layers use a
+// persistent KV cache.  Only new tokens (from conv output) go through
+// the transformer; attention reads K/V from the cache for context.
+
+static ggml_cgraph * build_encoder_graph_kv(
+    voxtral_context * ctx,
+    ggml_context * gctx,
+    const float * mel_data,   // [n_mel, n_frames] on CPU
+    int32_t n_frames,
+    int32_t enc_kv_used,      // entries currently in encoder KV cache
+    int32_t * out_seq_len)
+{
+    voxtral_model * model = ctx->model;
+
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
+
+    // --- Conv stem (identical to build_encoder_graph) ---
+
+    ggml_tensor * mel_input = ggml_new_tensor_3d(
+        gctx, GGML_TYPE_F32, n_frames, VOXTRAL_NUM_MEL_BINS, 1);
+    ggml_set_name(mel_input, "mel_input");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, mel_input, ctx->backend);
+
+    int32_t conv0_len = 0;
+    ggml_tensor * conv0_out = causal_conv1d_graph(
+        gctx, mel_input, n_frames,
+        model->enc_conv0_weight, model->enc_conv0_bias,
+        VOXTRAL_ENC_DIM, 3, 1, conv0_len);
+    if (!conv0_out) { if (out_seq_len) *out_seq_len = 0; return gf; }
+    conv0_out = ggml_gelu_erf(gctx, conv0_out);
+
+    int32_t conv_out_len = 0;
+    ggml_tensor * conv1_out = causal_conv1d_graph(
+        gctx, conv0_out, conv0_len,
+        model->enc_conv1_weight, model->enc_conv1_bias,
+        VOXTRAL_ENC_DIM, 3, 2, conv_out_len);
+    if (!conv1_out) { if (out_seq_len) *out_seq_len = 0; return gf; }
+    conv1_out = ggml_gelu_erf(gctx, conv1_out);
+
+    // Left-truncate to multiple of downsample_factor
+    const int32_t trunc = conv_out_len % VOXTRAL_DOWNSAMPLE_FACTOR;
+    ggml_tensor * x_len_first = conv1_out;
+    int32_t seq_len = conv_out_len;
+    if (trunc > 0) {
+        x_len_first = ggml_view_3d(gctx, conv1_out,
+            conv_out_len - trunc, VOXTRAL_ENC_DIM, 1,
+            conv1_out->nb[1], conv1_out->nb[2],
+            (size_t)trunc * conv1_out->nb[0]);
+        seq_len = conv_out_len - trunc;
+    }
+
+    // Transpose to [enc_dim, seq_len]
+    ggml_tensor * x = ggml_permute(gctx, x_len_first, 1, 0, 2, 3);
+    x = ggml_cont(gctx, x);
+    x = ggml_reshape_2d(gctx, x, VOXTRAL_ENC_DIM, seq_len);
+
+    const int32_t n_new = seq_len;   // new tokens from this chunk
+    const int32_t n_kv  = enc_kv_used + n_new;  // total KV entries after storing new
+
+    // Position tensor for Q RoPE: positions are [enc_kv_used, ..., enc_kv_used + n_new - 1]
+    ggml_tensor * enc_positions_q = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_new);
+    ggml_set_name(enc_positions_q, "enc_positions_q_kv");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_positions_q, ctx->backend);
+
+    // Position tensor for full K RoPE: positions are [0, 1, ..., n_kv - 1]
+    // We store PRE-RoPE keys in cache and apply RoPE fresh each time.
+    // This allows correct positioning after KV cache shifts (no pos_base needed).
+    ggml_tensor * enc_positions_k = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n_kv);
+    ggml_set_name(enc_positions_k, "enc_positions_k_kv");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_positions_k, ctx->backend);
+
+    // Attention mask: [n_kv, n_new] — causal sliding window
+    ggml_tensor * enc_attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_kv, n_new);
+    ggml_set_name(enc_attn_mask, "enc_attn_mask_kv");
+    ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_attn_mask, ctx->backend);
+    ggml_tensor * enc_attn_mask_f16 = ggml_cast(gctx, enc_attn_mask, GGML_TYPE_F16);
+
+    const int32_t enc_kv_dim = VOXTRAL_ENC_KV_HEADS * VOXTRAL_ENC_HEAD_DIM; // 2048
+
+    // --- Transformer layers with KV cache ---
+    for (int32_t i = 0; i < VOXTRAL_ENC_LAYERS; i++) {
+        auto & L = model->enc_layers[i];
+
+        ggml_tensor * residual = x;
+        ggml_tensor * x_norm = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS);
+        x_norm = ggml_mul(gctx, x_norm, L.attn_norm_weight);
+
+        // Q, K, V for new tokens only
+        ggml_tensor * q = ggml_mul_mat(gctx, L.attn_q_weight, x_norm);
+        q = ggml_add(gctx, q, L.attn_q_bias);
+
+        ggml_tensor * k = ggml_mul_mat(gctx, L.attn_k_weight, x_norm);
+
+        ggml_tensor * v = ggml_mul_mat(gctx, L.attn_v_weight, x_norm);
+        v = ggml_add(gctx, v, L.attn_v_bias);
+
+        // Reshape Q for RoPE: [head_dim, n_heads, n_new]
+        q = ggml_reshape_3d(gctx, q, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_HEADS, n_new);
+
+        // RoPE on Q only — positions [kv_used, kv_used+1, ..., kv_used+n_new-1]
+        q = ggml_rope_ext(gctx, q, enc_positions_q, nullptr,
+            VOXTRAL_ENC_HEAD_DIM, 0, 0,
+            VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // K is stored PRE-RoPE in cache. RoPE applied after concat (below).
+        // Flatten K for cache: [enc_kv_dim, n_new]
+        ggml_tensor * k_flat = ggml_cont(gctx,
+            ggml_reshape_2d(gctx, k, enc_kv_dim, n_new));
+
+        // Build full K, V by concatenating old cache + new computed values.
+        ggml_tensor * k_full;
+        ggml_tensor * v_full;
+
+        if (enc_kv_used > 0) {
+            ggml_tensor * k_old = ggml_view_2d(gctx, ctx->enc_kv_k,
+                enc_kv_dim, enc_kv_used, ctx->enc_kv_k->nb[1],
+                (size_t)i * ctx->enc_kv_k->nb[2]);
+            ggml_tensor * v_old = ggml_view_2d(gctx, ctx->enc_kv_v,
+                enc_kv_dim, enc_kv_used, ctx->enc_kv_v->nb[1],
+                (size_t)i * ctx->enc_kv_v->nb[2]);
+
+            k_full = ggml_concat(gctx, k_old, k_flat, 1);  // [enc_kv_dim, n_kv]
+            v_full = ggml_concat(gctx, v_old, v, 1);        // [enc_kv_dim, n_kv]
+        } else {
+            k_full = ggml_cont(gctx, k_flat);
+            v_full = ggml_cont(gctx, v);
+        }
+
+        // Store PRE-RoPE K in persistent cache for future calls.
+        {
+            ggml_tensor * k_slice = ggml_view_2d(gctx, ctx->enc_kv_k,
+                enc_kv_dim, n_new, ctx->enc_kv_k->nb[1],
+                (size_t)i * ctx->enc_kv_k->nb[2] + (size_t)enc_kv_used * ctx->enc_kv_k->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(gctx, k_flat, k_slice));
+
+            ggml_tensor * v_slice = ggml_view_2d(gctx, ctx->enc_kv_v,
+                enc_kv_dim, n_new, ctx->enc_kv_v->nb[1],
+                (size_t)i * ctx->enc_kv_v->nb[2] + (size_t)enc_kv_used * ctx->enc_kv_v->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(gctx, v, v_slice));
+        }
+
+        // Apply RoPE to full K (all n_kv entries) with positions [0..n_kv)
+        // This works correctly after KV shifts: shifted entries get new
+        // contiguous positions, maintaining correct relative distances.
+        ggml_tensor * k_full_3d = ggml_reshape_3d(gctx, k_full,
+            VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, n_kv);
+        k_full_3d = ggml_rope_ext(gctx, k_full_3d, enc_positions_k, nullptr,
+            VOXTRAL_ENC_HEAD_DIM, 0, 0,
+            VOXTRAL_ENC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // Flash attention
+        // Q: [head_dim, n_heads, n_new] -> [head_dim, n_new, n_heads]
+        q = ggml_permute(gctx, q, 0, 2, 1, 3);
+        // K: [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
+        ggml_tensor * k3 = ggml_permute(gctx, k_full_3d, 0, 2, 1, 3);
+        // V: [enc_kv_dim, n_kv] -> [head_dim, n_kv_heads, n_kv] -> [head_dim, n_kv, n_kv_heads]
+        ggml_tensor * v3 = ggml_reshape_3d(gctx, v_full, VOXTRAL_ENC_HEAD_DIM, VOXTRAL_ENC_KV_HEADS, n_kv);
+        v3 = ggml_permute(gctx, v3, 0, 2, 1, 3);
+
+        const float scale = 1.0f / sqrtf((float)VOXTRAL_ENC_HEAD_DIM);
+        ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q, k3, v3, enc_attn_mask_f16, scale, 0.0f, 0.0f);
+        attn_out = ggml_cont(gctx, attn_out);
+        attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_ENC_HEADS * VOXTRAL_ENC_HEAD_DIM, n_new);
+
+        // Output projection + residual
+        ggml_tensor * attn_proj = ggml_mul_mat(gctx, L.attn_o_weight, attn_out);
+        attn_proj = ggml_add(gctx, attn_proj, L.attn_o_bias);
+        x = ggml_add(gctx, residual, attn_proj);
+
+        // FFN
+        residual = x;
+        x_norm = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS);
+        x_norm = ggml_mul(gctx, x_norm, L.ffn_norm_weight);
+
+        ggml_tensor * gate = ggml_mul_mat(gctx, L.ffn_w1_weight, x_norm);
+        gate = ggml_silu(gctx, gate);
+        ggml_tensor * up = ggml_mul_mat(gctx, L.ffn_w3_weight, x_norm);
+        ggml_tensor * ffn_out = ggml_mul(gctx, gate, up);
+        ffn_out = ggml_mul_mat(gctx, L.ffn_w2_weight, ffn_out);
+        ffn_out = ggml_add(gctx, ffn_out, L.ffn_w2_bias);
+
+        x = ggml_add(gctx, residual, ffn_out);
+    }
+
+    // Final norm
+    x = ggml_rms_norm(gctx, x, VOXTRAL_ENC_NORM_EPS);
+    x = ggml_mul(gctx, x, model->enc_norm_weight);
+
+    // Copy to encoder_chunk_output
+    ggml_tensor * enc_out_view = ggml_view_2d(gctx, ctx->encoder_chunk_output,
+        VOXTRAL_ENC_DIM, n_new,
+        ctx->encoder_chunk_output->nb[1], 0);
+    ggml_tensor * cpy = ggml_cpy(gctx, x, enc_out_view);
+    ggml_build_forward_expand(gf, cpy);
+
+    if (out_seq_len) *out_seq_len = n_new;
+    return gf;
+}
+
+// run_encoder_chunk_kv: encode mel frames using encoder KV cache.
+// Returns number of new encoder tokens produced.
+static bool run_encoder_chunk_kv(
+    voxtral_context * ctx,
+    const float * mel_data,
+    int32_t n_frames,
+    int32_t enc_kv_used,       // entries in KV cache before this call
+    int32_t * out_seq_len)
+{
+    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+    std::vector<uint8_t> meta_buf(meta_size);
+
+    ggml_init_params p = { meta_size, meta_buf.data(), true };
+    ggml_context * gctx = ggml_init(p);
+
+    int32_t seq_len = 0;
+    ggml_cgraph * gf = build_encoder_graph_kv(ctx, gctx, mel_data, n_frames, enc_kv_used, &seq_len);
+
+    if (seq_len <= 0) {
+        ggml_free(gctx);
+        if (out_seq_len) *out_seq_len = 0;
+        return true;
+    }
+
+    const int32_t n_new = seq_len;
+    const int32_t n_kv  = enc_kv_used + n_new;
+
+    ggml_backend_sched_reset(ctx->sched_encoder);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched_encoder, gf)) {
+        LOG_ERR(ctx, "encoder_kv: graph alloc failed");
+        ggml_free(gctx);
+        return false;
+    }
+
+    // Set mel input
+    ggml_tensor * mel_input = ggml_graph_get_tensor(gf, "mel_input");
+    {
+        std::vector<float> mel_transposed(VOXTRAL_NUM_MEL_BINS * n_frames);
+        for (int32_t f = 0; f < n_frames; f++) {
+            for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++) {
+                mel_transposed[(size_t)f + (size_t)m * n_frames] = mel_data[(size_t)m * n_frames + f];
+            }
+        }
+        ggml_backend_tensor_set(mel_input, mel_transposed.data(), 0,
+            (size_t)n_frames * VOXTRAL_NUM_MEL_BINS * sizeof(float));
+    }
+
+    // Set Q positions: [kv_used, kv_used+1, ..., kv_used+n_new-1]
+    ggml_tensor * enc_positions_q = ggml_graph_get_tensor(gf, "enc_positions_q_kv");
+    {
+        std::vector<int32_t> positions(n_new);
+        for (int32_t i = 0; i < n_new; i++) {
+            positions[i] = enc_kv_used + i;
+        }
+        ggml_backend_tensor_set(enc_positions_q, positions.data(), 0, n_new * sizeof(int32_t));
+    }
+
+    // Set K positions: [0, 1, 2, ..., n_kv-1]
+    // Pre-RoPE keys stored in cache get RoPE applied fresh each time.
+    // After KV shifts, entries are renumbered from 0, keeping relative distances correct.
+    ggml_tensor * enc_positions_k = ggml_graph_get_tensor(gf, "enc_positions_k_kv");
+    {
+        std::vector<int32_t> positions(n_kv);
+        for (int32_t i = 0; i < n_kv; i++) {
+            positions[i] = i;
+        }
+        ggml_backend_tensor_set(enc_positions_k, positions.data(), 0, n_kv * sizeof(int32_t));
+    }
+
+    // Set attention mask: [n_kv, n_new] — causal sliding window
+    // Positions are contiguous [0..n_kv), so mask uses simple relative distances.
+    ggml_tensor * enc_attn_mask = ggml_graph_get_tensor(gf, "enc_attn_mask_kv");
+    {
+        std::vector<float> mask(n_kv * n_new, 0.0f);
+        for (int32_t i = 0; i < n_new; i++) {
+            for (int32_t j = 0; j < n_kv; j++) {
+                bool causal = (j <= (enc_kv_used + i));
+                bool in_window = ((enc_kv_used + i - j) < VOXTRAL_ENC_WINDOW);
+                if (!causal || !in_window) {
+                    mask[(size_t)i * n_kv + j] = -INFINITY;
+                }
+            }
+        }
+        ggml_backend_tensor_set(enc_attn_mask, mask.data(), 0, n_kv * n_new * sizeof(float));
+    }
+
+    ggml_backend_sched_graph_compute(ctx->sched_encoder, gf);
+    ggml_backend_sched_reset(ctx->sched_encoder);
+    ggml_free(gctx);
+
+    if (out_seq_len) *out_seq_len = n_new;
+    return true;
+}
+
+// ============================================================================
 // Graph Building: Adapter
 // ============================================================================
 
@@ -1510,6 +1857,49 @@ static ggml_cgraph * build_adapter_graph(
     ggml_build_forward_expand(gf, cpy);
 
     ctx->dec_seq_len = dec_seq;
+
+    return gf;
+}
+
+// Build adapter graph for a SLICE of encoder output (incremental mode).
+// Reads enc_count tokens from encoder_output at enc_offset, writes to
+// decoder_memory at dec_offset = enc_offset / VOXTRAL_DOWNSAMPLE_FACTOR.
+static ggml_cgraph * build_adapter_graph_slice(
+    voxtral_context * ctx,
+    ggml_context * gctx,
+    int32_t enc_offset,   // offset into encoder_output (must be multiple of DOWNSAMPLE_FACTOR)
+    int32_t enc_count)    // number of encoder tokens to process (multiple of DOWNSAMPLE_FACTOR)
+{
+    voxtral_model * model = ctx->model;
+    const int32_t dec_count = enc_count / VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int32_t dec_offset = enc_offset / VOXTRAL_DOWNSAMPLE_FACTOR;
+
+    ggml_cgraph * gf = ggml_new_graph(gctx);
+
+    // Read encoder_output slice: [enc_dim, enc_count] at enc_offset
+    ggml_tensor * enc_out = ggml_view_2d(gctx, ctx->encoder_output,
+        VOXTRAL_ENC_DIM, enc_count,
+        ctx->encoder_output->nb[1],
+        (size_t)enc_offset * ctx->encoder_output->nb[1]);
+
+    // Reshape for downsample: [enc_dim * 4, dec_count]
+    ggml_tensor * x = ggml_reshape_2d(gctx, enc_out,
+        VOXTRAL_ENC_DIM * VOXTRAL_DOWNSAMPLE_FACTOR, dec_count);
+
+    // Linear 0 + GELU
+    x = ggml_mul_mat(gctx, model->adapter_0_weight, x);
+    x = ggml_gelu_erf(gctx, x);
+
+    // Linear 2
+    x = ggml_mul_mat(gctx, model->adapter_2_weight, x);
+
+    // Copy to decoder_memory at dec_offset
+    ggml_tensor * dec_mem_view = ggml_view_2d(gctx, ctx->decoder_memory,
+        VOXTRAL_DEC_DIM, dec_count,
+        ctx->decoder_memory->nb[1],
+        (size_t)dec_offset * ctx->decoder_memory->nb[1]);
+    ggml_tensor * cpy = ggml_cpy(gctx, x, dec_mem_view);
+    ggml_build_forward_expand(gf, cpy);
 
     return gf;
 }
@@ -2381,4 +2771,646 @@ bool voxtral_transcribe_file(
 
     return voxtral_transcribe_from_audio(
         ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false);
+}
+
+// ============================================================================
+// Streaming Implementation
+// ============================================================================
+
+// Mel frames of overlap to include from previous chunk for encoder context.
+// 200 mel frames ≈ 100 encoder tokens ≈ 2s of audio.
+static constexpr int32_t STREAM_MEL_OVERLAP = 200;
+
+struct voxtral_stream {
+    voxtral_context * ctx;
+
+    // Audio accumulation
+    std::vector<float> audio_buf;       // all audio received so far (including left pad)
+    int32_t samples_processed;          // samples already mel'd + encoded
+
+    // Mel overlap: last STREAM_MEL_OVERLAP frames from previous chunk
+    // Stored in [n_mel, n_overlap_frames] layout
+    std::vector<float> prev_mel;
+    int32_t prev_mel_frames;            // actual frames stored (may be < STREAM_MEL_OVERLAP)
+
+    // Encoder state
+    int32_t enc_tokens_total;           // total encoder tokens in encoder_output
+    int32_t enc_rope_pos;               // next RoPE position
+    int32_t enc_kv_used;                // entries currently in encoder KV cache
+
+    // Decoder state
+    int32_t dec_positions_total;        // total adapter output positions
+    int32_t dec_position;               // next decoder position (for decode loop)
+    int32_t last_token;                 // last decoded token
+    bool    prefilled;                  // initial prefill done?
+    bool    seen_text;                  // for early stopping
+    int32_t consecutive_pad;            // for early stopping
+
+    // Generated tokens
+    std::vector<int32_t> all_tokens;
+    int32_t tokens_reported;            // how many tokens have been converted to text
+
+    // Pre-allocated max capacities
+    int32_t max_enc_tokens;
+    int32_t max_dec_positions;
+};
+
+voxtral_stream * voxtral_stream_create(voxtral_context * ctx) {
+    if (!ctx) return nullptr;
+
+    auto * s = new voxtral_stream();
+    s->ctx = ctx;
+
+    // Pre-compute max capacities for VOXTRAL_STREAM_MAX_AUDIO_SEC
+    const int32_t max_samples = VOXTRAL_STREAM_MAX_AUDIO_SEC * VOXTRAL_SAMPLE_RATE;
+    const int32_t left_pad_samples = VOXTRAL_N_LEFT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+    const int32_t right_pad_samples = VOXTRAL_N_RIGHT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+    const int32_t max_total_samples = left_pad_samples + max_samples + right_pad_samples;
+    const int32_t max_mel_frames = max_total_samples / VOXTRAL_HOP_LENGTH + 2;
+    s->max_enc_tokens = mel_frames_to_enc_tokens(max_mel_frames) + 256; // headroom
+    s->max_dec_positions = s->max_enc_tokens / VOXTRAL_DOWNSAMPLE_FACTOR + 64;
+
+    // Pre-allocate encoder_output
+    if (!alloc_encoder_output(ctx, s->max_enc_tokens)) {
+        LOG_ERR(ctx, "stream: failed to pre-allocate encoder output (%d tokens)", s->max_enc_tokens);
+        delete s;
+        return nullptr;
+    }
+
+    // Pre-allocate decoder_memory
+    if (!alloc_decoder_memory(ctx, s->max_dec_positions)) {
+        LOG_ERR(ctx, "stream: failed to pre-allocate decoder memory (%d positions)", s->max_dec_positions);
+        delete s;
+        return nullptr;
+    }
+
+    LOG_INFO(ctx, "stream created: max_enc=%d max_dec=%d", s->max_enc_tokens, s->max_dec_positions);
+
+    voxtral_stream_reset(s);
+    return s;
+}
+
+void voxtral_stream_free(voxtral_stream * stream) {
+    delete stream;
+}
+
+void voxtral_stream_reset(voxtral_stream * stream) {
+    if (!stream) return;
+
+    // Clear audio buffer and prepend left padding (silence)
+    const int32_t left_pad_samples = VOXTRAL_N_LEFT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+    stream->audio_buf.clear();
+    stream->audio_buf.resize(left_pad_samples, 0.0f);
+    stream->samples_processed = 0;
+
+    stream->enc_tokens_total = 0;
+    stream->enc_rope_pos = 0;
+    stream->enc_kv_used = 0;
+    // enc_kv_pos_base removed: pre-RoPE K storage means positions always [0..n_kv)
+
+    stream->dec_positions_total = 0;
+    stream->dec_position = 0;
+    stream->last_token = VOXTRAL_TOKEN_STREAMING_PAD;
+    stream->prefilled = false;
+    stream->seen_text = false;
+    stream->consecutive_pad = 0;
+
+    stream->all_tokens.clear();
+    stream->tokens_reported = 0;
+
+    // Clear mel overlap
+    stream->prev_mel.clear();
+    stream->prev_mel_frames = 0;
+
+    // Clear decoder KV cache
+    clear_kv_cache(stream->ctx);
+    clear_enc_kv_cache(stream->ctx);
+
+    LOG_INFO(stream->ctx, "stream reset (left_pad=%d samples)", left_pad_samples);
+}
+
+// Internal: encode a chunk of mel frames and append to encoder_output
+// If overlap_enc_skip > 0, the first overlap_enc_skip encoder tokens are
+// from the overlap region and should NOT be appended (they duplicate
+// tokens already in encoder_output).
+static bool stream_encode_chunk(
+    voxtral_stream * stream,
+    const float * mel_data,     // [n_mel, n_frames] layout
+    int32_t n_frames,
+    int32_t overlap_enc_skip)
+{
+    voxtral_context * ctx = stream->ctx;
+
+    // RoPE offset: overlap tokens must get the same positions as before.
+    // enc_rope_pos points to the next NEW position, so subtract overlap_enc_skip
+    // to re-assign the overlap tokens their original positions.
+    int32_t rope_start = stream->enc_rope_pos - overlap_enc_skip;
+
+    // Run encoder on this chunk
+    int32_t chunk_seq_len = 0;
+    if (!run_encoder_chunk(ctx, mel_data, n_frames, rope_start, &chunk_seq_len)) {
+        LOG_ERR(ctx, "stream: encoder chunk failed");
+        return false;
+    }
+
+    if (chunk_seq_len <= 0) {
+        LOG_DBG(ctx, "stream: encoder produced 0 tokens for %d mel frames", n_frames);
+        return true;
+    }
+
+    // Skip overlap tokens — only keep new tokens
+    int32_t new_tokens = chunk_seq_len - overlap_enc_skip;
+    if (new_tokens <= 0) {
+        LOG_DBG(ctx, "stream: encoder produced %d tokens, all overlap (skip=%d)", chunk_seq_len, overlap_enc_skip);
+        return true;  // RoPE pos unchanged — no new tokens
+    }
+
+    // Trim to multiple of downsample factor
+    int32_t usable = (new_tokens / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+    if (usable <= 0) {
+        LOG_DBG(ctx, "stream: encoder produced %d new tokens (< downsample factor), buffering", new_tokens);
+        return true;
+    }
+
+    // Check capacity
+    if (stream->enc_tokens_total + usable > stream->max_enc_tokens) {
+        LOG_ERR(ctx, "stream: encoder output overflow (%d + %d > %d)",
+                stream->enc_tokens_total, usable, stream->max_enc_tokens);
+        return false;
+    }
+
+    // Copy usable NEW tokens from encoder_chunk_output to encoder_output
+    // Skip overlap_enc_skip tokens at the beginning
+    {
+        const size_t elem_bytes = VOXTRAL_ENC_DIM * sizeof(float);
+        const size_t src_offset = (size_t)overlap_enc_skip * elem_bytes;
+        const size_t dst_offset = (size_t)stream->enc_tokens_total * elem_bytes;
+        const size_t copy_bytes = (size_t)usable * elem_bytes;
+
+        std::vector<uint8_t> tmp(copy_bytes);
+        ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), src_offset, copy_bytes);
+        ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
+    }
+
+    // Only advance RoPE by the usable new tokens (not the overlap)
+    stream->enc_rope_pos += usable;
+    stream->enc_tokens_total += usable;
+
+    LOG_INFO(ctx, "stream encode: %d mel frames -> %d enc tokens (%d new, skip %d, total %d, rope %d)",
+             n_frames, chunk_seq_len, usable, overlap_enc_skip,
+             stream->enc_tokens_total, stream->enc_rope_pos);
+    return true;
+}
+
+// Internal: encode mel frames using encoder KV cache (no overlap needed).
+// All tokens from conv are new — KV cache provides attention context.
+static bool stream_encode_chunk_kv(
+    voxtral_stream * stream,
+    const float * mel_data,
+    int32_t n_frames)
+{
+    voxtral_context * ctx = stream->ctx;
+
+    // Cap KV cache to limit flash_attn cost (n_kv ≈ 300 = 200 old + 100 new).
+    // Also shift if overflow would occur.
+    const int32_t ENC_KV_TARGET = 200;
+    int32_t max_new = mel_frames_to_enc_tokens(n_frames);
+    if (stream->enc_kv_used > ENC_KV_TARGET) {
+        int32_t shift = stream->enc_kv_used - ENC_KV_TARGET;
+        enc_kv_cache_shift_left(ctx, shift);
+        stream->enc_kv_used -= shift;
+        LOG_INFO(ctx, "stream: enc KV shifted by %d (kv_used %d)",
+                 shift, stream->enc_kv_used);
+    } else if (stream->enc_kv_used + max_new > VOXTRAL_ENC_WINDOW) {
+        int32_t shift = stream->enc_kv_used + max_new - VOXTRAL_ENC_WINDOW + 64;
+        shift = std::min(shift, stream->enc_kv_used);
+        enc_kv_cache_shift_left(ctx, shift);
+        stream->enc_kv_used -= shift;
+        LOG_INFO(ctx, "stream: enc KV shifted by %d (kv_used %d)",
+                 shift, stream->enc_kv_used);
+    }
+
+    int32_t n_new = 0;
+    if (!run_encoder_chunk_kv(ctx, mel_data, n_frames, stream->enc_kv_used, &n_new)) {
+        LOG_ERR(ctx, "stream: encoder KV chunk failed");
+        return false;
+    }
+
+    if (n_new <= 0) {
+        LOG_DBG(ctx, "stream: encoder KV produced 0 tokens for %d mel frames", n_frames);
+        return true;
+    }
+
+    // Trim to multiple of downsample factor
+    int32_t usable = (n_new / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+    if (usable <= 0) {
+        LOG_DBG(ctx, "stream: encoder KV produced %d tokens (< downsample factor)", n_new);
+        return true;
+    }
+
+    // Check capacity
+    if (stream->enc_tokens_total + usable > stream->max_enc_tokens) {
+        LOG_ERR(ctx, "stream: encoder output overflow (%d + %d > %d)",
+                stream->enc_tokens_total, usable, stream->max_enc_tokens);
+        return false;
+    }
+
+    // Copy tokens from encoder_chunk_output to encoder_output
+    {
+        const size_t elem_bytes = VOXTRAL_ENC_DIM * sizeof(float);
+        const size_t dst_offset = (size_t)stream->enc_tokens_total * elem_bytes;
+        const size_t copy_bytes = (size_t)usable * elem_bytes;
+
+        std::vector<uint8_t> tmp(copy_bytes);
+        ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), 0, copy_bytes);
+        ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), dst_offset, copy_bytes);
+    }
+
+    stream->enc_kv_used += usable;
+    stream->enc_tokens_total += usable;
+
+    LOG_INFO(ctx, "stream encode KV: %d mel -> %d enc (%d usable, total %d, kv_used %d)",
+             n_frames, n_new, usable, stream->enc_tokens_total, stream->enc_kv_used);
+    return true;
+}
+
+// Internal: run adapter on only NEW encoder tokens (truly incremental).
+// The adapter is stateless (two linear layers), so each output position
+// depends only on its 4 input positions — no need to re-process old tokens.
+static bool stream_run_adapter_incremental(voxtral_stream * stream) {
+    voxtral_context * ctx = stream->ctx;
+
+    const int32_t total_dec = stream->enc_tokens_total / VOXTRAL_DOWNSAMPLE_FACTOR;
+    if (total_dec <= 0) return true;
+    if (total_dec <= stream->dec_positions_total) return true;
+
+    // Check capacity
+    if (total_dec > stream->max_dec_positions) {
+        LOG_ERR(ctx, "stream: decoder memory overflow");
+        return false;
+    }
+
+    // Only process new encoder tokens
+    const int32_t old_enc = stream->dec_positions_total * VOXTRAL_DOWNSAMPLE_FACTOR;
+    const int32_t new_enc = stream->enc_tokens_total - old_enc;
+    if (new_enc <= 0) return true;
+
+    // Ensure multiple of downsample factor
+    const int32_t enc_count = (new_enc / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+    if (enc_count <= 0) return true;
+
+    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE +
+                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, false);
+    std::vector<uint8_t> meta_buf(meta_size);
+
+    ggml_init_params p = {
+        /*.mem_size  =*/ meta_size,
+        /*.mem_buffer=*/ meta_buf.data(),
+        /*.no_alloc  =*/ true,
+    };
+    ggml_context * gctx = ggml_init(p);
+
+    ggml_cgraph * gf = build_adapter_graph_slice(ctx, gctx, old_enc, enc_count);
+
+    ggml_backend_sched_reset(ctx->sched_adapter);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched_adapter, gf)) {
+        LOG_ERR(ctx, "stream: adapter graph alloc failed");
+        ggml_free(gctx);
+        return false;
+    }
+
+    ggml_backend_sched_graph_compute(ctx->sched_adapter, gf);
+    ggml_backend_sched_reset(ctx->sched_adapter);
+    ggml_free(gctx);
+
+    const int32_t new_dec_positions = total_dec - stream->dec_positions_total;
+    stream->dec_positions_total = total_dec;
+
+    LOG_INFO(ctx, "stream adapter: %d new positions (total %d)", new_dec_positions, stream->dec_positions_total);
+    return true;
+}
+
+bool voxtral_stream_warmup(voxtral_stream * stream) {
+    if (!stream) return false;
+    voxtral_context * ctx = stream->ctx;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Minimal warmup: encode a tiny mel chunk to warm up ggml graph compilation
+    // and run adapter once. Skips decoder prefill to keep warmup fast.
+    const int32_t warmup_mel_frames = 64;
+    std::vector<float> dummy_mel(VOXTRAL_NUM_MEL_BINS * warmup_mel_frames, 0.0f);
+
+    // Run encoder on dummy mel
+    int32_t chunk_seq_len = 0;
+    run_encoder_chunk(ctx, dummy_mel.data(), warmup_mel_frames, 0, &chunk_seq_len);
+
+    // Run adapter if we got encoder tokens
+    if (chunk_seq_len > 0) {
+        int32_t usable = (chunk_seq_len / VOXTRAL_DOWNSAMPLE_FACTOR) * VOXTRAL_DOWNSAMPLE_FACTOR;
+        if (usable > 0) {
+            const size_t copy_bytes = (size_t)usable * VOXTRAL_ENC_DIM * sizeof(float);
+            std::vector<uint8_t> tmp(copy_bytes);
+            ggml_backend_tensor_get(ctx->encoder_chunk_output, tmp.data(), 0, copy_bytes);
+            ggml_backend_tensor_set(ctx->encoder_output, tmp.data(), 0, copy_bytes);
+
+            const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE +
+                                     ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, false);
+            std::vector<uint8_t> meta_buf(meta_size);
+            ggml_init_params p = { meta_size, meta_buf.data(), true };
+            ggml_context * gctx = ggml_init(p);
+
+            ctx->enc_seq_used = usable;
+            ctx->decoder_memory->ne[1] = usable / VOXTRAL_DOWNSAMPLE_FACTOR;
+            ggml_cgraph * gf = build_adapter_graph(ctx, gctx);
+            ggml_backend_sched_reset(ctx->sched_adapter);
+            if (ggml_backend_sched_alloc_graph(ctx->sched_adapter, gf)) {
+                ggml_backend_sched_graph_compute(ctx->sched_adapter, gf);
+            }
+            ggml_backend_sched_reset(ctx->sched_adapter);
+            ggml_free(gctx);
+            ctx->decoder_memory->ne[1] = stream->max_dec_positions;
+        }
+    }
+
+    // Reset stream so it's clean for real audio
+    voxtral_stream_reset(stream);
+
+    LOG_INFO(ctx, "warmup done in %.1f ms (encoder + adapter graphs warmed)", elapsed_ms(t0));
+    return true;
+}
+
+// Internal: run decoder prefill + initial decode steps
+static bool stream_decoder_prefill(voxtral_stream * stream) {
+    voxtral_context * ctx = stream->ctx;
+
+    // Build prompt: [BOS] + [STREAMING_PAD] * (N_LEFT_PAD_TOKENS + N_DELAY_TOKENS)
+    std::vector<int32_t> prompt_ids;
+    prompt_ids.push_back(VOXTRAL_TOKEN_BOS);
+    for (int32_t i = 0; i < VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS; i++) {
+        prompt_ids.push_back(VOXTRAL_TOKEN_STREAMING_PAD);
+    }
+    const int32_t L = (int32_t)prompt_ids.size(); // 39
+
+    if (L > stream->dec_positions_total) {
+        LOG_ERR(ctx, "stream: prompt %d exceeds available positions %d", L, stream->dec_positions_total);
+        return false;
+    }
+
+    // Prefill all but last token
+    std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
+    if (L > 1) {
+        // Update ctx state temporarily for prefill
+        ctx->enc_seq_used = stream->enc_tokens_total;
+        ctx->dec_seq_len = stream->dec_positions_total;
+
+        if (!run_decoder_prefill(ctx, prompt_ids.data(), L - 1, logits.data())) {
+            return false;
+        }
+    }
+
+    // One step with last prefix token
+    if (!run_decoder_step(ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data())) {
+        return false;
+    }
+
+    // First token from prefill
+    int32_t token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+    stream->all_tokens.push_back(token);
+    stream->last_token = token;
+    stream->dec_position = L;
+
+    if (token >= ctx->model->tokenizer_num_special_tokens) {
+        stream->seen_text = true;
+    }
+    if (token == VOXTRAL_TOKEN_STREAMING_PAD) {
+        stream->consecutive_pad++;
+    }
+
+    stream->prefilled = true;
+    LOG_INFO(ctx, "stream prefill done: L=%d first_token=%d", L, token);
+    return true;
+}
+
+// Internal: run decoder steps for available positions
+static bool stream_decode_available(voxtral_stream * stream, std::string & new_text, bool allow_early_stop = false) {
+    voxtral_context * ctx = stream->ctx;
+    new_text.clear();
+
+    const int32_t n_audio = stream->dec_positions_total;
+    std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
+
+    while (stream->dec_position < n_audio) {
+        // EOS: stop during flush, but during feed just treat as PAD and continue
+        if (stream->last_token == VOXTRAL_TOKEN_EOS) {
+            if (allow_early_stop) break;
+            // Reset to PAD so decoder can continue with new audio
+            stream->last_token = VOXTRAL_TOKEN_STREAMING_PAD;
+            stream->consecutive_pad++;
+        }
+
+        // Early stopping: only during flush (allow_early_stop=true).
+        // During normal streaming, PAD tokens between speech segments are normal.
+        if (allow_early_stop && stream->seen_text && stream->consecutive_pad >= VOXTRAL_N_RIGHT_PAD_TOKENS) {
+            LOG_INFO(ctx, "stream: early stop at pos %d", stream->dec_position);
+            break;
+        }
+
+        if (!run_decoder_step(ctx, stream->last_token,
+                              stream->dec_position, stream->dec_position,
+                              logits.data())) {
+            return false;
+        }
+
+        int32_t token = (int32_t)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+
+        stream->all_tokens.push_back(token);
+        stream->last_token = token;
+        stream->dec_position++;
+
+        if (token == VOXTRAL_TOKEN_STREAMING_PAD) {
+            stream->consecutive_pad++;
+        } else {
+            stream->consecutive_pad = 0;
+            if (token >= ctx->model->tokenizer_num_special_tokens) {
+                stream->seen_text = true;
+            }
+        }
+    }
+
+    // Convert any new tokens to text
+    if ((int32_t)stream->all_tokens.size() > stream->tokens_reported) {
+        std::vector<int32_t> new_tokens(
+            stream->all_tokens.begin() + stream->tokens_reported,
+            stream->all_tokens.end());
+        new_text = decode_tokens(*ctx->model, new_tokens);
+        stream->tokens_reported = (int32_t)stream->all_tokens.size();
+    }
+
+    return true;
+}
+
+bool voxtral_stream_feed(
+    voxtral_stream * stream,
+    const float    * audio,
+    int32_t          n_samples,
+    std::string    & new_text)
+{
+    new_text.clear();
+    if (!stream || !audio || n_samples <= 0) return false;
+
+    voxtral_context * ctx = stream->ctx;
+    auto t_start = std::chrono::steady_clock::now();
+
+    // Append new audio
+    stream->audio_buf.insert(stream->audio_buf.end(), audio, audio + n_samples);
+
+    // Check if we have enough new audio to process (minimum ~0.5s = 8000 samples)
+    const int32_t new_samples = (int32_t)stream->audio_buf.size() - stream->samples_processed;
+    if (new_samples < 8000 && stream->prefilled) {
+        return true; // accumulate more
+    }
+
+    // Compute mel spectrogram for the new audio segment
+    // Include a small overlap for STFT window context
+    const int32_t stft_context = VOXTRAL_WINDOW_SIZE; // 400 samples
+    int32_t mel_start = std::max(0, stream->samples_processed - stft_context);
+    int32_t mel_len = (int32_t)stream->audio_buf.size() - mel_start;
+
+    int32_t n_frames = 0;
+    const int32_t max_frames = mel_len / VOXTRAL_HOP_LENGTH + 2;
+    std::vector<float> mel_data(VOXTRAL_NUM_MEL_BINS * max_frames);
+
+    compute_mel_spectrogram(
+        stream->audio_buf.data() + mel_start, mel_len,
+        ctx->mel_filters_cpu.data(),
+        ctx->hann_window.data(),
+        mel_data.data(), &n_frames);
+
+    // Calculate how many mel frames correspond to already-processed audio
+    int32_t skip_frames = 0;
+    if (stream->samples_processed > mel_start) {
+        skip_frames = (stream->samples_processed - mel_start) / VOXTRAL_HOP_LENGTH;
+    }
+    if (skip_frames >= n_frames) {
+        stream->samples_processed = (int32_t)stream->audio_buf.size();
+        return true;
+    }
+
+    int32_t new_frames = n_frames - skip_frames;
+
+    // Ensure even frame count for conv stride=2
+    if (new_frames % 2 != 0) {
+        new_frames -= 1;
+    }
+    if (new_frames <= 0) {
+        stream->samples_processed = (int32_t)stream->audio_buf.size();
+        return true;
+    }
+
+    // Extract new mel frames in [n_mel, new_frames] layout
+    std::vector<float> new_mel(VOXTRAL_NUM_MEL_BINS * new_frames);
+    for (int32_t m = 0; m < VOXTRAL_NUM_MEL_BINS; m++) {
+        memcpy(new_mel.data() + (size_t)m * new_frames,
+               mel_data.data() + (size_t)m * n_frames + skip_frames,
+               new_frames * sizeof(float));
+    }
+
+    stream->samples_processed = (int32_t)stream->audio_buf.size();
+
+    // Cap decoder pipeline: the model can't handle unbounded decoder positions.
+    // Do a full stream reset (including encoder KV) to get a clean slate.
+    // ~200 dec positions = ~16s of audio. After reset, ~4s gap until re-prefill.
+    const int32_t MAX_DEC_POSITIONS = 200;
+    if (stream->dec_positions_total > MAX_DEC_POSITIONS) {
+        LOG_INFO(ctx, "stream: full reset (dec_positions %d > %d)",
+                 stream->dec_positions_total, MAX_DEC_POSITIONS);
+
+        // Full reset: encoder KV, decoder KV, all state
+        voxtral_stream_reset(stream);
+
+        // Trim audio buffer: keep only last 2s of audio for continuity
+        const int32_t keep_samples = 2 * VOXTRAL_SAMPLE_RATE; // 32000
+        if ((int32_t)stream->audio_buf.size() > keep_samples) {
+            std::vector<float> trimmed(
+                stream->audio_buf.end() - keep_samples,
+                stream->audio_buf.end());
+            stream->audio_buf = std::move(trimmed);
+        }
+        stream->samples_processed = 0;
+
+        // Return early — this chunk's audio is in the buffer,
+        // will be processed on the next call
+        return true;
+    }
+
+    // Encode new mel frames using KV cache (no mel overlap needed —
+    // encoder attention context comes from the persistent KV cache).
+    auto t_enc = std::chrono::steady_clock::now();
+    if (!stream_encode_chunk_kv(stream, new_mel.data(), new_frames)) {
+        return false;
+    }
+    LOG_INFO(ctx, "stream enc: %.1f ms", elapsed_ms(t_enc));
+
+    // Run adapter on new encoder tokens
+    auto t_ada = std::chrono::steady_clock::now();
+    if (!stream_run_adapter_incremental(stream)) {
+        return false;
+    }
+    LOG_INFO(ctx, "stream ada: %.1f ms", elapsed_ms(t_ada));
+
+    // Initial prefill if not done yet
+    if (!stream->prefilled && stream->dec_positions_total >= (VOXTRAL_N_LEFT_PAD_TOKENS + VOXTRAL_N_DELAY_TOKENS + 2)) {
+        auto t_pre = std::chrono::steady_clock::now();
+        if (!stream_decoder_prefill(stream)) {
+            return false;
+        }
+        LOG_INFO(ctx, "stream prefill: %.1f ms", elapsed_ms(t_pre));
+    }
+
+    // Decode available positions
+    if (stream->prefilled) {
+        auto t_dec = std::chrono::steady_clock::now();
+        if (!stream_decode_available(stream, new_text)) {
+            return false;
+        }
+        LOG_INFO(ctx, "stream dec: %.1f ms", elapsed_ms(t_dec));
+    }
+
+    LOG_INFO(ctx, "stream feed: %d samples, total %.1f ms, text='%s'",
+             n_samples, elapsed_ms(t_start), new_text.c_str());
+    return true;
+}
+
+bool voxtral_stream_flush(
+    voxtral_stream * stream,
+    std::string    & remaining_text)
+{
+    remaining_text.clear();
+    if (!stream) return false;
+
+    voxtral_context * ctx = stream->ctx;
+
+    // Add right padding (silence) to flush delayed tokens
+    const int32_t right_pad_samples = VOXTRAL_N_RIGHT_PAD_TOKENS * VOXTRAL_RAW_AUDIO_LENGTH_PER_TOK;
+    std::vector<float> silence(right_pad_samples, 0.0f);
+
+    // Feed the silence through the pipeline
+    std::string text;
+    if (!voxtral_stream_feed(stream, silence.data(), right_pad_samples, text)) {
+        return false;
+    }
+    remaining_text = text;
+
+    // Decode any remaining positions (with early stopping enabled for flush)
+    if (stream->prefilled) {
+        std::string more_text;
+        if (!stream_decode_available(stream, more_text, /*allow_early_stop=*/true)) {
+            return false;
+        }
+        remaining_text += more_text;
+    }
+
+    LOG_INFO(ctx, "stream flush: '%s'", remaining_text.c_str());
+    return true;
 }
