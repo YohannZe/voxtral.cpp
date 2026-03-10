@@ -2973,7 +2973,7 @@ static bool stream_encode_chunk_kv(
 
     // Cap KV cache to limit flash_attn cost (n_kv ≈ 300 = 200 old + 100 new).
     // Also shift if overflow would occur.
-    const int32_t ENC_KV_TARGET = 200;
+    const int32_t ENC_KV_TARGET = 100;
     int32_t max_new = mel_frames_to_enc_tokens(n_frames);
     if (stream->enc_kv_used > ENC_KV_TARGET) {
         int32_t shift = stream->enc_kv_used - ENC_KV_TARGET;
